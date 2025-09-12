@@ -6,6 +6,8 @@
 #include "Result.h"
 #include "Util.h"
 
+#include <functional>
+
 namespace dnssd
 {
 
