@@ -23,7 +23,9 @@ function(find_bonjour_sdk)
 
     # Standard installation locations
     list(APPEND BONJOUR_SEARCH_PATHS
+        "C:/Program Files/Bonjour"
         "C:/Program Files/Bonjour SDK"
+        "C:/Program Files (x86)/Bonjour"
         "C:/Program Files (x86)/Bonjour SDK"
     )
 
