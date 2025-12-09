@@ -59,7 +59,7 @@ private:
     SharedConnection mSharedConnection;
     std::map<std::string, ScopedDnsServiceRef> mBrowsers;
     std::map<std::string, Service> mServices;
-    std::atomic_bool mKeepGoing = ATOMIC_VAR_INIT (true);
+    std::atomic_bool mKeepGoing = { true };
     std::thread mThread;
     std::recursive_mutex mLock;
 
