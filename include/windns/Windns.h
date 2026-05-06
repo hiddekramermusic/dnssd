@@ -1,0 +1,12 @@
+#pragma once
+
+#if _WIN32 && USE_WINDNS
+#define _WINSOCKAPI_ // Prevents inclusion of winsock.h in windows.h
+#include <Ws2tcpip.h>
+#include <winsock2.h>
+#include <windows.h>
+#include <windns.h>
+#include <winerror.h>
+#else
+#error Set '-DUSE_WINDNS=ON' as a cmake option during generation to use Windns.
+#endif
