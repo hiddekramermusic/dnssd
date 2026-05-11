@@ -51,7 +51,7 @@ private:
 
     bool mCallbackPending = false;
     bool mCallbackFinished = false;
-    bool mRegistered = false;
+    std::atomic<bool> mRegistered = false;
 
     std::mutex mLock; // For synchronisation with the callback
     std::condition_variable mCv; // For synchronisation with the callback

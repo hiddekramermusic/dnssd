@@ -1,8 +1,149 @@
 #include "../../include/windns/WindnsAdvertiser.h"
 #include <sstream>
 #include <string>
+#include <vector>
 #include <windows.h>
 #include <windns.h>
+
+namespace {
+
+dnssd::Result toWString (const std::string& str, std::wstring& out)
+{
+    if (str.empty())
+    {
+        out.clear();
+        return {};
+    }
+
+    for (UINT codePage : { CP_UTF8, CP_ACP })
+    {
+        DWORD flags = (codePage == CP_UTF8) ? MB_ERR_INVALID_CHARS : 0;
+        int size = MultiByteToWideChar (codePage, flags, str.c_str(), static_cast<int> (str.size()), nullptr, 0);
+        if (size == 0)
+            continue;
+
+        out.resize (size);
+        if (MultiByteToWideChar (codePage, flags, str.c_str(), static_cast<int> (str.size()), &out[0], size) != 0)
+            return {};
+    }
+
+    std::stringstream msg;
+    msg << "MultiByteToWideChar failed to convert string. Error code: " << GetLastError();
+    return dnssd::Result (msg.str());
+}
+
+/**
+ * Builds and registers a DNS-SD service instance on all available network interfaces.
+ *
+ * @param instanceName - Fully qualified instance name, e.g. L"MyService._http._tcp.local".
+ * @param port - The port on which the service is running.
+ * @param txtRecord - TXT record key/value pairs.
+ * @param ctx - Request context passed to the completion callback.
+ * @param req - Register request struct; any existing pServiceInstance is freed and replaced.
+ *              Set to nullptr on registration failure.
+ * @param cancelHandle - Receives a handle that can be used to cancel the pending registration.
+ * @param callback - Completion callback invoked when registration succeeds or fails.
+ * @return Empty Result on success, or an error Result if string conversion or registration failed.
+ */
+dnssd::Result doRegister (
+    PCWSTR instanceName,
+    uint16_t port,
+    const dnssd::TxtRecord& txtRecord,
+    dnssd::WindnsAdvertiser::RegisterRequestContext& ctx,
+    DNS_SERVICE_REGISTER_REQUEST& req,
+    PDNS_SERVICE_CANCEL& cancelHandle,
+    PDNS_SERVICE_REGISTER_COMPLETE callback)
+{
+    DWORD bufferSize = 0;
+    GetComputerNameExW (ComputerNameDnsHostname, nullptr, &bufferSize);
+    if (GetLastError() != ERROR_MORE_DATA)
+    {
+        std::stringstream msg;
+        msg << "Failed to get hostname size. Error code: " << GetLastError();
+        return dnssd::Result (msg.str());
+    }
+
+    std::wstring hostname;
+    hostname.resize (bufferSize);
+    if (!GetComputerNameExW (ComputerNameDnsHostname, &hostname[0], &bufferSize))
+    {
+        std::stringstream msg;
+        msg << "Failed to get hostname. Error code: " << GetLastError();
+        return dnssd::Result (msg.str());
+    }
+    hostname.resize (bufferSize); // trim null terminator written by the API
+
+    // Build TXT record key/value arrays.
+    // wstrings must stay alive until DnsServiceConstructInstance returns.
+    std::vector<std::wstring> keyStrings, valueStrings;
+    keyStrings.reserve (txtRecord.size());
+    valueStrings.reserve (txtRecord.size());
+    for (const auto& kv : txtRecord)
+    {
+        std::wstring key, value;
+        auto rKey = toWString (kv.first, key);
+        if (rKey.hasError()) return rKey;
+        auto rValue = toWString (kv.second, value);
+        if (rValue.hasError()) return rValue;
+        keyStrings.push_back (std::move (key));
+        valueStrings.push_back (std::move (value));
+    }
+
+    std::vector<PCWSTR> keys, values;
+    keys.reserve (keyStrings.size());
+    values.reserve (valueStrings.size());
+    for (size_t i = 0; i < keyStrings.size(); ++i)
+    {
+        keys.push_back (keyStrings[i].c_str());
+        values.push_back (valueStrings[i].c_str());
+    }
+
+    if (req.pServiceInstance != nullptr)
+    {
+        DnsServiceFreeInstance (req.pServiceInstance);
+        req.pServiceInstance = nullptr;
+    }
+
+    PDNS_SERVICE_INSTANCE instance = DnsServiceConstructInstance (
+        instanceName,
+        hostname.c_str(),
+        nullptr, // IPv4: let the system determine the address per interface
+        nullptr, // IPv6: let the system determine the address per interface
+        port,
+        0, // priority
+        0, // weight
+        static_cast<DWORD> (keyStrings.size()),
+        keys.data(),
+        values.data());
+
+    if (instance == nullptr)
+    {
+        std::stringstream msg;
+        msg << "DnsServiceConstructInstance failed. Error code: " << GetLastError();
+        return dnssd::Result (msg.str());
+    }
+
+    req = {};
+    req.Version = DNS_QUERY_REQUEST_VERSION1;
+    req.InterfaceIndex = 0; // Register on all available network interfaces
+    req.pServiceInstance = instance;
+    req.pRegisterCompletionCallback = callback;
+    req.pQueryContext = &ctx;
+    req.hCredentials = nullptr;
+    req.unicastEnabled = FALSE;
+
+    DWORD status = DnsServiceRegister (&req, cancelHandle);
+    if (status != DNS_REQUEST_PENDING && status != ERROR_SUCCESS)
+    {
+        DnsServiceFreeInstance (instance);
+        req.pServiceInstance = nullptr;
+        return dnssd::Result (static_cast<DNS_STATUS> (status));
+    }
+
+    return {};
+}
+
+} // namespace
 
 namespace dnssd
 {
@@ -15,52 +156,106 @@ Result WindnsAdvertiser::registerService (
     const TxtRecord& txtRecord) noexcept
 {
     if (domain != nullptr)
-    {
         return Result ("Windns does not support other domain names than '.local', you need to leave the domain parameter as a nullptr");
-    }
+
+    if (mRegistered.load (std::memory_order_acquire))
+        return Result ("Service already registered, unregister first or use updateTxtRecord function to update an existing service");
 
     mTxtRecord = txtRecord;
 
-    // Get Host name
-    DWORD bufferSize = 0;
-
-    GetComputerNameExW (ComputerNameDnsHostname, nullptr, &bufferSize);
-
-    if (GetLastError() != ERROR_MORE_DATA)
+    // Build the fully qualified instance name: "<name>.<regType>.local"
+    // If no name is given, fall back to the computer's DNS hostname as the service name.
+    std::wstring instanceName;
+    if (name != nullptr && name[0] != '\0')
     {
-        std::stringstream message;
-        message << "Failed to get hostname size. Error code: " << GetLastError();
-        Result res (message.str());
-        return res;
-    }
-
-    std::wstring hostname;    
-    hostname.resize (bufferSize);
-
-    if (GetComputerNameExW (ComputerNameDnsHostname, &hostname[0], &bufferSize))
-    {
-        // bufferSize is updated to the number of characters actually written
-        // (excluding the null terminator), so we resize the string to trim the extra null.
-        hostname.resize (bufferSize);
+        auto r = toWString (name, instanceName);
+        if (r.hasError()) return r;
     }
     else
     {
-        std::stringstream message;
-        message << "Failed to get hostname. Error code: " << GetLastError();
-        Result res (message.str());
-        return res;
+        DWORD bufferSize = 0;
+        GetComputerNameExW (ComputerNameDnsHostname, nullptr, &bufferSize);
+        if (GetLastError() != ERROR_MORE_DATA)
+        {
+            std::stringstream msg;
+            msg << "Failed to get hostname size. Error code: " << GetLastError();
+            return Result (msg.str());
+        }
+        instanceName.resize (bufferSize);
+        if (!GetComputerNameExW (ComputerNameDnsHostname, &instanceName[0], &bufferSize))
+        {
+            std::stringstream msg;
+            msg << "Failed to get hostname. Error code: " << GetLastError();
+            return Result (msg.str());
+        }
+        instanceName.resize (bufferSize);
     }
 
-    DNS_SERVICE_INSTANCE instance { 0 };
+    std::wstring regTypeW;
+    auto r = toWString (regType, regTypeW);
+    if (r.hasError()) return r;
+    instanceName += L"." + regTypeW + L".local";
 
-    // Initialise to 0 sets InterfaceIndex to 0, which makes DnsServiceRegister broadcast to all available network interfaces
-    DNS_SERVICE_REGISTER_REQUEST req { 0 };
-    req.Version = DNS_QUERY_REQUEST_VERSION1;
+    mCtx = { RegisterEventType::Register, this };
+    mCallbackPending = true;
 
+    Result result = doRegister (
+        instanceName.c_str(),
+        port,
+        txtRecord,
+        mCtx,
+        mReq,
+        mCancelPtr,
+        registerCompleteCallback);
 
-    return {};
+    if (result.hasError())
+        mCallbackPending = false;
+
+    return result;
 }
 
+Result WindnsAdvertiser::updateTxtRecord (const TxtRecord& txtRecord)
+{
+    mTxtRecord = txtRecord;
+
+    if (!mRegistered.load (std::memory_order_acquire))
+        return {};
+
+    // WinDNS has no in-place TXT update API; deregister and re-register.
+    // Copy the existing instance name and port before unregisterService frees the instance.
+    std::wstring instanceName (mReq.pServiceInstance->pszInstanceName);
+    uint16_t port = mReq.pServiceInstance->wPort;
+
+    unregisterService();
+
+    mCtx = { RegisterEventType::Register, this };
+    mCallbackPending = true;
+
+    Result result = doRegister (instanceName.c_str(), port, txtRecord, mCtx, mReq, mCancelPtr, registerCompleteCallback);
+
+    if (result.hasError())
+        mCallbackPending = false;
+
+    return result;
+}
+
+void WindnsAdvertiser::unregisterService() noexcept
+{
+    if (!mRegistered.load (std::memory_order_acquire))
+        return;
+
+    mCtx.event_type = RegisterEventType::Deregister;
+    mCallbackFinished = false;
+    mCallbackPending = true;
+
+    DWORD status = DnsServiceDeRegister (&mReq, nullptr);
+
+    if (status == DNS_REQUEST_PENDING)
+    {
+        std::unique_lock<std::mutex> lock (mLock);
+        mCv.wait (lock, [this]() { return mCallbackFinished; });
+    }
+}
 
 WindnsAdvertiser::~WindnsAdvertiser()
 {
@@ -68,7 +263,6 @@ WindnsAdvertiser::~WindnsAdvertiser()
     {
         if (mCtx.event_type == RegisterEventType::Register)
         {
-            // Cancel register
             DWORD res = DnsServiceRegisterCancel (mCancelPtr);
             if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
             {
@@ -83,9 +277,7 @@ WindnsAdvertiser::~WindnsAdvertiser()
     }
     else if (mRegistered)
     {
-        // Deregister service
         mCallbackFinished = false;
-
         mCallbackPending = true;
         DWORD status = DnsServiceDeRegister (&mReq, mCancelPtr);
 
@@ -98,7 +290,6 @@ WindnsAdvertiser::~WindnsAdvertiser()
         }
     }
 
-    // No pending registrations or deregistrations will be happening at this point
     if (mReq.pServiceInstance != nullptr)
     {
         DnsServiceFreeInstance (mReq.pServiceInstance);
@@ -111,71 +302,58 @@ VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQue
     auto* ctx = static_cast<dnssd::WindnsAdvertiser::RegisterRequestContext*> (pQueryContext);
 
     if (ctx == nullptr)
-    {
         return;
-    }
 
-    // Register event
     if (ctx->event_type == dnssd::WindnsAdvertiser::RegisterEventType::Register)
     {
         if (Status == ERROR_SUCCESS)
         {
             if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
-            {
-                owner->mRegistered = true;
-            }
+                owner->mRegistered.store (true, std::memory_order_release);
         }
         else
         {
-            dnssd::Result res (Status); // Parses status into descriptive message
+            dnssd::Result res (Status);
             std::stringstream expanded_message;
             expanded_message << "Registering DNS Service failed: " << res.description();
             res = dnssd::Result (expanded_message.str());
 
             if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
-            {
                 if (owner->onAdvertiserErrorCallback)
                     owner->onAdvertiserErrorCallback (res);
-            }
         }
     }
 
-    // Deregister event
     if (ctx->event_type == dnssd::WindnsAdvertiser::RegisterEventType::Deregister)
     {
         if (Status == ERROR_SUCCESS)
         {
             if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
-            {
-                owner->mRegistered = false;
-            }
+                owner->mRegistered.store (false, std::memory_order_release);
         }
         else
         {
-            dnssd::Result res (Status); // Parses status into descriptive message
+            dnssd::Result res (Status);
             std::stringstream expanded_message;
             expanded_message << "Deregistering DNS Service failed: " << res.description();
             res = dnssd::Result (expanded_message.str());
 
             if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
-            {
                 if (owner->onAdvertiserErrorCallback)
                     owner->onAdvertiserErrorCallback (res);
-            }
         }
     }
 
-	if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
-    {
+    if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
         owner->onCallbackFinished();
-    }
 }
 
 void WindnsAdvertiser::onCallbackFinished()
 {
-    std::lock_guard<std::mutex> lockGaurd (mLock);
+    std::lock_guard<std::mutex> lockGuard (mLock);
     mCallbackFinished = true;
     mCallbackPending = false;
     mCv.notify_one();
 }
+
 } // namespace dnssd
