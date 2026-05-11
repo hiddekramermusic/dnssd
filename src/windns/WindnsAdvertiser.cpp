@@ -1,4 +1,6 @@
-#include "../../include/windns/WindnsAdvertiser.h"
+#include "windns/WindnsAdvertiser.h"
+#include "windns/WindnsUtil.h"
+
 #include <sstream>
 #include <string>
 #include <vector>
@@ -6,31 +8,6 @@
 #include <windns.h>
 
 namespace {
-
-dnssd::Result toWString (const std::string& str, std::wstring& out)
-{
-    if (str.empty())
-    {
-        out.clear();
-        return {};
-    }
-
-    for (UINT codePage : { CP_UTF8, CP_ACP })
-    {
-        DWORD flags = (codePage == CP_UTF8) ? MB_ERR_INVALID_CHARS : 0;
-        int size = MultiByteToWideChar (codePage, flags, str.c_str(), static_cast<int> (str.size()), nullptr, 0);
-        if (size == 0)
-            continue;
-
-        out.resize (size);
-        if (MultiByteToWideChar (codePage, flags, str.c_str(), static_cast<int> (str.size()), &out[0], size) != 0)
-            return {};
-    }
-
-    std::stringstream msg;
-    msg << "MultiByteToWideChar failed to convert string. Error code: " << GetLastError();
-    return dnssd::Result (msg.str());
-}
 
 /**
  * Builds and registers a DNS-SD service instance on all available network interfaces.
@@ -81,9 +58,9 @@ dnssd::Result doRegister (
     for (const auto& kv : txtRecord)
     {
         std::wstring key, value;
-        auto rKey = toWString (kv.first, key);
+        auto rKey = dnssd::toWideString (kv.first, key);
         if (rKey.hasError()) return rKey;
-        auto rValue = toWString (kv.second, value);
+        auto rValue = dnssd::toWideString (kv.second, value);
         if (rValue.hasError()) return rValue;
         keyStrings.push_back (std::move (key));
         valueStrings.push_back (std::move (value));
@@ -168,7 +145,7 @@ Result WindnsAdvertiser::registerService (
     std::wstring instanceName;
     if (name != nullptr && name[0] != '\0')
     {
-        auto r = toWString (name, instanceName);
+        auto r = dnssd::toWideString (name, instanceName);
         if (r.hasError()) return r;
     }
     else
@@ -192,7 +169,7 @@ Result WindnsAdvertiser::registerService (
     }
 
     std::wstring regTypeW;
-    auto r = toWString (regType, regTypeW);
+    auto r = dnssd::toWideString (regType, regTypeW);
     if (r.hasError()) return r;
     instanceName += L"." + regTypeW + L".local";
 

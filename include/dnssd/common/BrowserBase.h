@@ -2,7 +2,13 @@
 
 #include "../ServiceDescription.h"
 #include "Result.h"
+
+// Service accesses protected callback members directly through its BonjourBrowser owner reference.
+// WinDNS has no equivalent: WindnsBrowser handles resolution internally as a derived class,
+// so its methods can access the protected members without friendship.
+#if !_WIN32 || !USE_WINDNS
 #include "dnssd/bonjour/Service.h"
+#endif
 
 #include <functional>
 
@@ -98,7 +104,9 @@ public:
     }
 
 protected:
+#if !_WIN32 || !USE_WINDNS
     friend Service;
+#endif
 
     ServiceDiscoveredAsyncCallback onServiceDiscoveredCallback;
     ServiceResolvedAsyncCallback onServiceResolvedCallback;

@@ -50,10 +50,16 @@ target_sources(dnssd-cpp PRIVATE
 )
 else()
 target_sources(dnssd-cpp PRIVATE
+    include/dnssd/Browser.h
     include/windns/Windns.h
     include/windns/WindnsAdvertiser.h
+    include/windns/WindnsBrowser.h
+    include/windns/WindnsDiscoveredService.h
+    include/windns/WindnsUtil.h
 
     src/windns/WindnsAdvertiser.cpp
+    src/windns/WindnsBrowser.cpp
+    src/windns/WindnsUtil.cpp
 )
 endif()
 
