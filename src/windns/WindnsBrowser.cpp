@@ -148,6 +148,7 @@ VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PD
 {
     auto* self = static_cast<WindnsBrowser*> (pQueryContext);
 
+    // Cancelling the browse request calls this callback one more time for cleanup.
     if (static_cast<DNS_STATUS> (Status) == ERROR_CANCELLED)
     {
         std::lock_guard<std::mutex> lk (self->mCancelMutex);

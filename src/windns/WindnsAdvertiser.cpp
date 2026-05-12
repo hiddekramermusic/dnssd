@@ -283,8 +283,11 @@ VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQue
     if (ctx == nullptr)
         return;
 
+    DNSSD_LOG_DEBUG ("> registerCompleteCallback enter" << std::endl);
+
     if (ctx->event_type == dnssd::WindnsAdvertiser::RegisterEventType::Register)
     {
+        DNSSD_LOG_DEBUG ("- registerCompleteCallback event type register" << std::endl);
         if (Status == ERROR_SUCCESS)
         {
             if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
@@ -297,6 +300,8 @@ VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQue
             expanded_message << "Registering DNS Service failed: " << res.description();
             res = dnssd::Result (expanded_message.str());
 
+            DNSSD_LOG_DEBUG (expanded_message.str());
+
             if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
                 if (owner->onAdvertiserErrorCallback)
                     owner->onAdvertiserErrorCallback (res);
@@ -305,6 +310,7 @@ VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQue
 
     if (ctx->event_type == dnssd::WindnsAdvertiser::RegisterEventType::Deregister)
     {
+        DNSSD_LOG_DEBUG ("- registerCompleteCallback event type deregister" << std::endl);
         if (Status == ERROR_SUCCESS)
         {
             if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
@@ -317,6 +323,8 @@ VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQue
             expanded_message << "Deregistering DNS Service failed: " << res.description();
             res = dnssd::Result (expanded_message.str());
 
+            DNSSD_LOG_DEBUG (expanded_message.str());
+
             if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
                 if (owner->onAdvertiserErrorCallback)
                     owner->onAdvertiserErrorCallback (res);
@@ -325,6 +333,8 @@ VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQue
 
     if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
         owner->onCallbackFinished();
+
+    DNSSD_LOG_DEBUG ("> registerCompleteCallback exit" << std::endl);
 }
 
 void WindnsAdvertiser::onCallbackFinished()
