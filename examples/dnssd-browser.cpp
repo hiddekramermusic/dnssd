@@ -7,7 +7,7 @@ int main (int argc, char* argv[])
 {
     if (argc < 2)
     {
-        std::cout << "Expected an argument which specifies the servicetype to browse for (example: _http._tcp)"
+        std::cout << "Expected at least one argument which specifies the servicetype to browse for (example: _http._tcp)"
                   << std::endl;
         return -1;
     }
@@ -25,6 +25,9 @@ int main (int argc, char* argv[])
             }
             catch (...)
             {
+                std::cout << "Failed to parse polling_interval argument, make sure to use this format: "
+                             "'polling_interval=1000'\n";
+                pollingIntervalMs = 0;
             }
         }
     }
