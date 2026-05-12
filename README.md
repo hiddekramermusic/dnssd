@@ -106,3 +106,11 @@ browser.browseFor("_http._tcp");
 ```
 
 Choose the interval based on how quickly you need to detect changes.
+
+### CMake building with Windns and TXT polling loop in the browser example
+
+Here is an example CMake command for building with WIN_DNS enabled and with the TXT record polling loop enabled in the browser example: 
+
+```bash
+cmake -B build -S . -DUSE_WINDNS=ON -DDNSSD_BROWSER_TXT_POLL_INTERVAL_MS=1000
+```
