@@ -10,3 +10,13 @@
 #else
 #error Set '-DUSE_WINDNS=ON' as a cmake option during generation to use Windns.
 #endif
+
+#include <chrono>
+
+namespace dnssd
+{
+
+/// Maximum time to wait for a WinDNS async callback to complete during shutdown.
+constexpr std::chrono::seconds kWindnsCallbackTimeout { 5 };
+
+} // namespace dnssd

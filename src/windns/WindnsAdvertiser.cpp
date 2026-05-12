@@ -230,7 +230,9 @@ void WindnsAdvertiser::unregisterService() noexcept
     if (status == DNS_REQUEST_PENDING)
     {
         std::unique_lock<std::mutex> lock (mLock);
-        mCv.wait (lock, [this]() { return mCallbackFinished; });
+        bool completed = mCv.wait_for (lock, kWindnsCallbackTimeout, [this]() { return mCallbackFinished; });
+        if (!completed)
+            DNSSD_LOG_DEBUG ("WindnsAdvertiser::unregisterService: timed out waiting for deregister callback" << std::endl)
     }
 }
 
@@ -261,9 +263,9 @@ WindnsAdvertiser::~WindnsAdvertiser()
         if (status == DNS_REQUEST_PENDING)
         {
             std::unique_lock<std::mutex> lock (mLock);
-            mCv.wait (lock, [this]() {
-                return mCallbackFinished;
-            });
+            bool completed = mCv.wait_for (lock, kWindnsCallbackTimeout, [this]() { return mCallbackFinished; });
+            if (!completed)
+                DNSSD_LOG_DEBUG ("WindnsAdvertiser::~WindnsAdvertiser: timed out waiting for deregister callback" << std::endl)
         }
     }
 

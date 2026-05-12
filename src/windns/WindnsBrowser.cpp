@@ -53,43 +53,54 @@ namespace dnssd
 
 WindnsBrowser::~WindnsBrowser()
 {
-    std::lock_guard<std::recursive_mutex> lg (mLock);
-
-    for (auto& entry : mBrowseCancels)
     {
-        DWORD res = DnsServiceBrowseCancel (&entry.second);
-        if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-            DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsServiceBrowseCancel failed: "
-                             << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
-    }
-    mBrowseCancels.clear();
+        std::lock_guard<std::recursive_mutex> lg (mLock);
 
-    for (auto& entry : mServices)
-    {
-        WindnsDiscoveredService& service = entry.second;
-        if (service.resolveStarted && !service.resolveFinished)
+        // Cancel resolve and address queries first — these have no guaranteed final callback.
+        for (auto& entry : mServices)
         {
-            DWORD res = DnsServiceResolveCancel (&service.resolveCancel);
+            WindnsDiscoveredService& service = entry.second;
+            if (service.resolveStarted && !service.resolveFinished)
+            {
+                DWORD res = DnsServiceResolveCancel (&service.resolveCancel);
+                if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
+                    DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsServiceResolveCancel failed: "
+                                     << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
+            }
+            if (service.aQueryInFlight)
+            {
+                DWORD res = DnsCancelQuery (&service.aCancel);
+                if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
+                    DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsCancelQuery (A) failed: "
+                                     << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
+            }
+            if (service.aaaaQueryInFlight)
+            {
+                DWORD res = DnsCancelQuery (&service.aaaaCancel);
+                if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
+                    DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsCancelQuery (AAAA) failed: "
+                                     << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
+            }
+        }
+        mServices.clear();
+
+        // Cancel browses last — DnsServiceBrowseCancel guarantees one final browseCallback
+        // with ERROR_CANCELLED, which we use as a synchronisation point below.
+        mPendingBrowseCancels = static_cast<int> (mBrowseCancels.size());
+        for (auto& entry : mBrowseCancels)
+        {
+            DWORD res = DnsServiceBrowseCancel (&entry.second);
             if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-                DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsServiceResolveCancel failed: "
+                DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsServiceBrowseCancel failed: "
                                  << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
         }
-        if (service.aQueryInFlight)
-        {
-            DWORD res = DnsCancelQuery (&service.aCancel);
-            if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-                DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsCancelQuery (A) failed: "
-                                 << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
-        }
-        if (service.aaaaQueryInFlight)
-        {
-            DWORD res = DnsCancelQuery (&service.aaaaCancel);
-            if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-                DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsCancelQuery (AAAA) failed: "
-                                 << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
-        }
+        mBrowseCancels.clear();
     }
-    mServices.clear();
+
+    std::unique_lock<std::mutex> lk (mCancelMutex);
+    bool completed = mCancelCv.wait_for (lk, kWindnsCallbackTimeout, [this]() { return mPendingBrowseCancels == 0; });
+    if (!completed)
+        DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: timed out waiting for browse cancellation callbacks" << std::endl)
 }
 
 Result WindnsBrowser::browseFor (const std::string& serviceType)
@@ -136,6 +147,15 @@ Result WindnsBrowser::browseFor (const std::string& serviceType)
 VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PDNS_RECORD pDnsRecord)
 {
     auto* self = static_cast<WindnsBrowser*> (pQueryContext);
+
+    if (static_cast<DNS_STATUS> (Status) == ERROR_CANCELLED)
+    {
+        std::lock_guard<std::mutex> lk (self->mCancelMutex);
+        if (--self->mPendingBrowseCancels == 0)
+            self->mCancelCv.notify_one();
+        return;
+    }
+
     std::lock_guard<std::recursive_mutex> lg (self->mLock);
 
     DNSSD_LOG_DEBUG ("> browseCallback enter" << std::endl)
@@ -209,9 +229,9 @@ VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PD
                 // Do not fire onServiceDiscovered again; refresh addresses if already resolved.
                 it->second.ttl = record->dwTtl;
 
+				// If resolve is still in flight it will issue address queries on completion
                 if (it->second.resolveFinished && !it->second.description.hostTarget.empty())
                     self->issueAddressQueries (instanceName, it->second.description.hostTarget);
-					// If resolve is still in flight it will issue address queries on completion
             }
         }
     }
@@ -251,7 +271,7 @@ VOID WINAPI WindnsBrowser::resolveCallback (DWORD Status, PVOID pQueryContext, P
 
     if (pInstance == nullptr)
     {
-        DNSSD_LOG_DEBUG ("- resolveCallback: pInstance is null despite success status for " << instanceName << std::endl)
+        DNSSD_LOG_DEBUG ("- resolveCallback: pInstance is null"  << std::endl)
         return;
     }
 
@@ -550,6 +570,7 @@ void WindnsBrowser::onAddressResult (const std::string& instanceName, PDNS_RECOR
             continue;
         }
 
+        // Goodbye message for a specific interface
         if (record->dwTtl == 0)
         {
             auto ifIt = desc.interfaces.find (ifIndex);

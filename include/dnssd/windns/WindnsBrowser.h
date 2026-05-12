@@ -10,6 +10,7 @@
 #include "dnssd/common/Log.h"
 #include "dnssd/common/Result.h"
 
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <string>
@@ -50,6 +51,11 @@ private:
     std::map<std::string, WindnsDiscoveredService> mServices;
 
     std::recursive_mutex mLock;
+
+    /// Synchronises the destructor with the final ERROR_CANCELLED browseCallback per active browse.
+    std::mutex mCancelMutex;
+    std::condition_variable mCancelCv;
+    int mPendingBrowseCancels = 0;
 
     // -- Context structs passed as pQueryContext to WinDNS async calls --
     // Browse passes 'this' directly; resolve and address queries need the instance name too.
