@@ -10,10 +10,12 @@
 #include "dnssd/common/Log.h"
 #include "dnssd/common/Result.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 
 namespace dnssd
 {
@@ -44,7 +46,24 @@ public:
      */
     Result browseFor (const std::string& serviceType) override;
 
+    /**
+     * Enables periodic re-resolution of discovered services to detect TXT record updates.
+     * The WinDNS API has no record-change subscription, so polling is the only reliable way
+     * to pick up TXT changes announced by remote peers (e.g. Bonjour on macOS).
+     * Each poll re-issues DnsServiceResolve for every known service and fires
+     * onServiceResolved if the TXT record has changed.
+     *
+     * @param intervalMs Poll interval in milliseconds. Pass 0 to disable (default).
+     */
+    void setTxtPollIntervalMs (uint32_t intervalMs);
+
 private:
+    std::thread mPollThread;
+    std::condition_variable mPollCv;
+    std::mutex mPollMutex; // used only to satisfy wait_for; does not guard any data
+    uint32_t mTxtPollIntervalMs = 0;
+    std::atomic<bool> mStopPollThread { false };
+
     /// One cancel handle per browsed service type, keyed by wide-string service type.
     std::map<std::wstring, DNS_SERVICE_CANCEL> mBrowseCancels;
 
@@ -154,6 +173,12 @@ private:
      * @return true if there was an error, false otherwise.
      */
     bool reportIfError (const Result& result) const noexcept;
+
+    /**
+     * Background thread body for TXT polling. Sleeps for mTxtPollIntervalMs between each
+     * round of re-resolves; wakes early when mStopPollThread is set on destruction.
+     */
+    void pollLoop();
 };
 
 } // namespace dnssd

@@ -13,7 +13,12 @@ This library provides an interface which allows to use dns-sd in an easy way.
 
 ### Windows
 
-* Bonjour SDK (Apple)  
+This library can either use the builtin Windns.h headers, or use the Bonjour SDK by Apple.
+
+By default the Bonjour SDK is selected, but you can switch to Windns by setting 'USE_WINDNS' as a CMake flag.
+In case you're using Windns, you do not need the Bonjour dependency.
+
+* Bonjour SDK (Apple) - If 'USE_WINDNS' is not enabled 
 This library uses the Bonjour SDK and expects it to be in the default install location (ie C:\Program Files\Bonjour SDK).
 
 ## How to use
@@ -82,3 +87,22 @@ If you don't use CMake for building then this way will produce a separate librar
     cmake --build .
     
 After this you end up with two test command line utilities and a libray.
+
+## Windns notes
+
+### TXT record updates (advertiser)
+Windns has some slight differences compared to Bonjour, the main important difference being that in place TXT record modifications are not supported. Instead, the library deregisters the current service, and reregisters the service with the new TXT record.
+
+### TXT record update detection (browser)
+
+The WinDNS API has no record-change subscription mechanism equivalent to Bonjour's `DNSServiceQueryRecord`. As a result, TXT record updates announced by remote peers (e.g. a Bonjour service on macOS) are not detected automatically.
+
+To work around this, `WindnsBrowser` (and `Browser` when built with `USE_WINDNS`) provides opt-in periodic re-resolution via `setTxtPollIntervalMs`. When enabled, the browser re-issues `DnsServiceResolve` for every known service at the given interval and fires `onServiceResolved` if the TXT record has changed.
+
+```cpp
+dnssd::Browser browser;
+browser.setTxtPollIntervalMs(2000); // re-resolve every 2 seconds; 0 = disabled (default)
+browser.browseFor("_http._tcp");
+```
+
+Choose the interval based on how quickly you need to detect changes.

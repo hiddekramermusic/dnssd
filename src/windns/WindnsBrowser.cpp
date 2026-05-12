@@ -54,8 +54,46 @@ bool parseInstanceName (
 namespace dnssd
 {
 
+void WindnsBrowser::setTxtPollIntervalMs (uint32_t intervalMs)
+{
+    mTxtPollIntervalMs = intervalMs;
+    if (intervalMs > 0 && !mPollThread.joinable())
+        mPollThread = std::thread (&WindnsBrowser::pollLoop, this);
+}
+
+void WindnsBrowser::pollLoop()
+{
+    while (!mStopPollThread)
+    {
+        {
+            std::unique_lock<std::mutex> lk (mPollMutex);
+            mPollCv.wait_for (lk, std::chrono::milliseconds (mTxtPollIntervalMs),
+                              [this]() { return mStopPollThread.load(); });
+        }
+
+        if (mStopPollThread)
+            break;
+
+        std::lock_guard<std::recursive_mutex> lg (mLock);
+        for (auto& entry : mServices)
+        {
+            WindnsDiscoveredService& service = entry.second;
+            if (service.resolveFinished)
+            {
+                service.resolveFinished = false;
+                issueResolve (entry.first);
+            }
+        }
+    }
+}
+
 WindnsBrowser::~WindnsBrowser()
 {
+    mStopPollThread = true;
+    mPollCv.notify_one();
+    if (mPollThread.joinable())
+        mPollThread.join();
+
     {
         std::lock_guard<std::recursive_mutex> lg (mLock);
 
