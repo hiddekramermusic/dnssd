@@ -1,9 +1,9 @@
 #pragma once
 
 #if _WIN32 && USE_WINDNS
-#include "windns/WindnsBrowser.h"
+#include <dnssd/windns/WindnsBrowser.h>
 #else
-#include "dnssd/bonjour/BonjourBrowser.h"
+#include <dnssd/bonjour/BonjourBrowser.h>
 #endif
 
 namespace dnssd

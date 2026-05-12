@@ -1,5 +1,5 @@
-#include "windns/WindnsBrowser.h"
-#include "windns/WindnsUtil.h"
+#include "dnssd/windns/WindnsBrowser.h"
+#include "dnssd/windns/WindnsUtil.h"
 
 namespace
 {

@@ -20,6 +20,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 set(CMAKE_CXX_STANDARD 11)
 
 add_library(dnssd-cpp STATIC
+    include/dnssd/Browser.h
+    include/dnssd/Advertiser.h
+
     include/dnssd/common/AdvertiserBase.h
     include/dnssd/common/BrowserBase.h
     include/dnssd/common/TxtRecord.h
@@ -32,7 +35,6 @@ add_library(dnssd-cpp STATIC
 
 if (NOT (WIN32 AND USE_WINDNS))
 target_sources(dnssd-cpp PRIVATE
-    include/dnssd/Browser.h
     include/dnssd/bonjour/Bonjour.h
     include/dnssd/bonjour/BonjourAdvertiser.h
     include/dnssd/bonjour/BonjourBrowser.h
@@ -50,12 +52,11 @@ target_sources(dnssd-cpp PRIVATE
 )
 else()
 target_sources(dnssd-cpp PRIVATE
-    include/dnssd/Browser.h
-    include/windns/Windns.h
-    include/windns/WindnsAdvertiser.h
-    include/windns/WindnsBrowser.h
-    include/windns/WindnsDiscoveredService.h
-    include/windns/WindnsUtil.h
+    include/dnssd/windns/Windns.h
+    include/dnssd/windns/WindnsAdvertiser.h
+    include/dnssd/windns/WindnsBrowser.h
+    include/dnssd/windns/WindnsDiscoveredService.h
+    include/dnssd/windns/WindnsUtil.h
 
     src/windns/WindnsAdvertiser.cpp
     src/windns/WindnsBrowser.cpp
@@ -74,7 +75,7 @@ if (WIN32)
 
     if (USE_WINDNS)
         target_link_libraries(dnssd-cpp PRIVATE ws2_32 dnsapi iphlpapi)
-        target_compile_definitions(dnssd-cpp PRIVATE USE_WINDNS)
+        target_compile_definitions(dnssd-cpp PUBLIC USE_WINDNS)
     else()
         find_package(BonjourSDK REQUIRED)
         target_link_libraries(dnssd-cpp PUBLIC Bonjour::dnssd)

@@ -4,7 +4,7 @@
 #include <string>
 
 #if USE_WINDNS
-#include "../include/windns/Windns.h"
+#include <dnssd/windns/Windns.h>
 #else
 #include <dnssd/bonjour/Bonjour.h>
 #endif

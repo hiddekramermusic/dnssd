@@ -1,4 +1,4 @@
-#include "windns/WindnsUtil.h"
+#include "dnssd/windns/WindnsUtil.h"
 
 #include <sstream>
 #include <windows.h>
