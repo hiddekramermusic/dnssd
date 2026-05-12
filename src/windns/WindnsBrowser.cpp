@@ -240,13 +240,15 @@ VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PD
             }
             else
             {
-                // Subsequent sighting — service is reachable on another interface or address.
-                // Do not fire onServiceDiscovered again; refresh addresses if already resolved.
+                // Subsequent sighting — re-resolve to pick up TXT record updates.
+                // Skip if a resolve is already in flight.
                 it->second.ttl = record->dwTtl;
 
-				// If resolve is still in flight it will issue address queries on completion
-                if (it->second.resolveFinished && !it->second.description.hostTarget.empty())
-                    self->issueAddressQueries (instanceName, it->second.description.hostTarget);
+                if (it->second.resolveFinished)
+                {
+                    it->second.resolveFinished = false;
+                    self->issueResolve (instanceName);
+                }
             }
         }
     }
@@ -419,29 +421,18 @@ void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const 
 
     WindnsDiscoveredService& service = it->second;
 
-    if (service.aQueryInFlight)
-    {
-        DWORD res = DnsCancelQuery (&service.aCancel);
-        if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-            DNSSD_LOG_DEBUG ("WindnsBrowser::issueAddressQueries: DnsCancelQuery (A) failed: "
-                             << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
-        service.aQueryInFlight = false;
-    }
-    if (service.aaaaQueryInFlight)
-    {
-        DWORD res = DnsCancelQuery (&service.aaaaCancel);
-        if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-            DNSSD_LOG_DEBUG ("WindnsBrowser::issueAddressQueries: DnsCancelQuery (AAAA) failed: "
-                             << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
-        service.aaaaQueryInFlight = false;
-    }
-
     std::wstring hostNameW;
     auto r = toWideString (hostName, hostNameW);
     if (reportIfError (r))
         return;
 
+    // .local hostnames must be resolved via multicast DNS; standard unicast DNS has no record of them.
+    const DWORD queryOptions = (hostName.size() >= 6 && hostName.compare (hostName.size() - 6, 6, ".local") == 0)
+                                   ? DNS_QUERY_MULTICAST_ONLY
+                                   : DNS_QUERY_STANDARD;
+
     // A record (IPv4) query
+    if (!service.aQueryInFlight)
     {
         auto* ctx = new AddressQueryContext { this, instanceName };
         ctx->queryResult.Version = DNS_QUERY_REQUEST_VERSION1;
@@ -450,7 +441,7 @@ void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const 
         req.Version = DNS_QUERY_REQUEST_VERSION1;
         req.QueryName = hostNameW.c_str();
         req.QueryType = DNS_TYPE_A;
-        req.QueryOptions = DNS_QUERY_STANDARD;
+        req.QueryOptions = queryOptions;
         req.InterfaceIndex = 0;
         req.pQueryCompletionCallback = &WindnsBrowser::aQueryCallback;
         req.pQueryContext = ctx;
@@ -475,6 +466,7 @@ void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const 
     }
 
     // AAAA record (IPv6) query
+    if (!service.aaaaQueryInFlight)
     {
         auto* ctx = new AddressQueryContext { this, instanceName };
         ctx->queryResult.Version = DNS_QUERY_REQUEST_VERSION1;
@@ -483,7 +475,7 @@ void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const 
         req.Version = DNS_QUERY_REQUEST_VERSION1;
         req.QueryName = hostNameW.c_str();
         req.QueryType = DNS_TYPE_AAAA;
-        req.QueryOptions = DNS_QUERY_STANDARD;
+        req.QueryOptions = queryOptions;
         req.InterfaceIndex = 0;
         req.pQueryCompletionCallback = &WindnsBrowser::aaaaQueryCallback;
         req.pQueryContext = ctx;
@@ -557,7 +549,45 @@ void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVI
     if (onServiceResolvedCallback)
         onServiceResolvedCallback (desc, pInstance->dwInterfaceIndex);
 
-    if (!desc.hostTarget.empty())
+    // Bonjour includes A/AAAA records as additional records in the mDNS SRV response, which
+    // DnsServiceResolve populates into ip4Address/ip6Address. Use them directly to avoid a
+    // separate DnsQueryEx round-trip, which does not reliably resolve .local names via mDNS.
+    bool hasAddresses = false;
+    const uint32_t ifIndex = pInstance->dwInterfaceIndex;
+
+    if (pInstance->ip4Address != nullptr)
+    {
+        char buf[INET_ADDRSTRLEN];
+        if (inet_ntop (AF_INET, pInstance->ip4Address, buf, sizeof (buf)) != nullptr)
+        {
+            std::string address = buf;
+            if (desc.interfaces[ifIndex].insert (address).second)
+            {
+                DNSSD_LOG_DEBUG ("- onResolveResult: added IPv4 " << address << " for " << instanceName << std::endl)
+                if (onAddressAddedCallback)
+                    onAddressAddedCallback (desc, address, ifIndex);
+            }
+            hasAddresses = true;
+        }
+    }
+
+    if (pInstance->ip6Address != nullptr)
+    {
+        char buf[INET6_ADDRSTRLEN];
+        if (inet_ntop (AF_INET6, pInstance->ip6Address, buf, sizeof (buf)) != nullptr)
+        {
+            std::string address = buf;
+            if (desc.interfaces[ifIndex].insert (address).second)
+            {
+                DNSSD_LOG_DEBUG ("- onResolveResult: added IPv6 " << address << " for " << instanceName << std::endl)
+                if (onAddressAddedCallback)
+                    onAddressAddedCallback (desc, address, ifIndex);
+            }
+            hasAddresses = true;
+        }
+    }
+
+    if (!hasAddresses && !desc.hostTarget.empty())
         issueAddressQueries (instanceName, desc.hostTarget);
 }
 

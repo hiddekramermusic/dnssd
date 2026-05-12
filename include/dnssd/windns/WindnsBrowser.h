@@ -22,10 +22,11 @@ namespace dnssd
  * Windows native DNS-SD implementation of BrowserBase using the WinDNS API (windns.h).
  * Only the .local mDNS domain is supported; custom domains are not available via this API.
  *
- * Discovery is performed in three async stages:
- *   1. DnsServiceBrowse     — finds PTR records, fires onServiceDiscovered / onServiceRemoved
- *   2. DnsServiceResolve    — resolves host, port, and TXT record, fires onServiceResolved
- *   3. DnsQueryEx (A/AAAA) — enumerates all addresses, fires onAddressAdded / onAddressRemoved
+ * Discovery is performed in async stages:
+ *   1. DnsServiceBrowse   — finds PTR records, fires onServiceDiscovered / onServiceRemoved
+ *   2. DnsServiceResolve  — resolves host, port, TXT, and (if included) addresses via ip4Address /
+ *                           ip6Address on DNS_SERVICE_INSTANCE; fires onServiceResolved and onAddressAdded
+ *   3. DnsQueryEx (A/AAAA) — fallback address query when DnsServiceResolve does not include addresses
  *
  * All WinDNS callbacks arrive on thread-pool threads; mLock serialises access to mServices.
  */
