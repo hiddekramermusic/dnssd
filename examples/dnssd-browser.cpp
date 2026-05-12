@@ -7,9 +7,29 @@ int main (int argc, char* argv[])
 {
     if (argc < 2)
     {
-        std::cout << "Expected an argument which specifies the servicetype to browse for (example: _http._tcp)"
+        std::cout << "Expected at least one argument which specifies the servicetype to browse for (example: _http._tcp)"
                   << std::endl;
         return -1;
+    }
+
+    int pollingIntervalMs = 0;
+    for (int i = 2; i < argc; ++i)
+    {
+        std::string arg (argv[i]);
+        const std::string prefix = "polling_interval=";
+        if (arg.substr (0, prefix.size()) == prefix)
+        {
+            try
+            {
+                pollingIntervalMs = std::stoi (arg.substr (prefix.size()));
+            }
+            catch (...)
+            {
+                std::cout << "Failed to parse polling_interval argument, make sure to use this format: "
+                             "'polling_interval=1000'\n";
+                pollingIntervalMs = 0;
+            }
+        }
     }
 
     dnssd::Browser browser;
@@ -39,6 +59,10 @@ int main (int argc, char* argv[])
     browser.onBrowseError ([] (const dnssd::Result& error) {
         std::cout << "Error: " << error.description() << std::endl;
     });
+
+#if defined(_WIN32) && defined(USE_WINDNS)
+    browser.setTxtPollIntervalMs (pollingIntervalMs);
+#endif
 
     auto const result = browser.browseFor (argv[1]);
     if (result.hasError())

@@ -3,7 +3,11 @@
 #include <exception>
 #include <string>
 
+#if USE_WINDNS
+#include <dnssd/windns/Windns.h>
+#else
 #include <dnssd/bonjour/Bonjour.h>
+#endif
 
 namespace dnssd
 {
@@ -17,11 +21,17 @@ class Result
 public:
     Result() = default;
 
+#if !USE_WINDNS
     /**
      * Construct this Result with given DNSServiceErrorType.
      * @param error The DNSServiceErrorType to store.
      */
     explicit Result (DNSServiceErrorType error) noexcept;
+#endif
+
+#if USE_WINDNS && _WIN32
+    explicit Result(DNS_STATUS  error) noexcept;
+#endif
 
     /**
      * Constructs this Result with an error message.
@@ -46,10 +56,17 @@ public:
     std::string description() const noexcept;
 
 private:
+#if USE_WINDNS
+    DNS_STATUS mError = ERROR_SUCCESS;
+#else
     DNSServiceErrorType mError = kDNSServiceErr_NoError;
+#endif
+
     std::string mErrorMsg;
 
+#if !USE_WINDNS
     static const char* DNSServiceErrorDescription (DNSServiceErrorType error) noexcept;
+#endif
 };
 
 } // namespace dnssd

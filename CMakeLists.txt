@@ -3,9 +3,10 @@ cmake_minimum_required(VERSION 3.15)
 project(dnssd-cpp VERSION 0.0.1)
 
 option(DNSSD_NO_EXAMPLES "Disable examples" OFF)
+option(USE_WINDNS "Use Windns.h API instead of Bonjour on Windows" OFF)
 
 if (WIN32)
-    if (NOT BONJOUR_SDK_ROOT)
+    if (NOT BONJOUR_SDK_ROOT AND NOT USE_WINDNS)
         set(BONJOUR_SDK_ROOT "" CACHE PATH
             "Path to Bonjour SDK (Windows only). Leave empty for auto-detection.")
 
@@ -20,18 +21,27 @@ set(CMAKE_CXX_STANDARD 11)
 
 add_library(dnssd-cpp STATIC
     include/dnssd/Browser.h
-    include/dnssd/bonjour/Bonjour.h
-    include/dnssd/bonjour/BonjourAdvertiser.h
-    include/dnssd/bonjour/BonjourBrowser.h
-    include/dnssd/bonjour/ScopedDnsServiceRef.h
-    include/dnssd/bonjour/Service.h
-    include/dnssd/bonjour/SharedConnection.h
+    include/dnssd/Advertiser.h
+
     include/dnssd/common/AdvertiserBase.h
     include/dnssd/common/BrowserBase.h
     include/dnssd/common/TxtRecord.h
     include/dnssd/common/Util.h
 
     src/ServiceDescription.cpp
+    src/common/Result.cpp
+    src/common/Log.cpp
+)
+
+if (NOT (WIN32 AND USE_WINDNS))
+target_sources(dnssd-cpp PRIVATE
+    include/dnssd/bonjour/Bonjour.h
+    include/dnssd/bonjour/BonjourAdvertiser.h
+    include/dnssd/bonjour/BonjourBrowser.h
+    include/dnssd/bonjour/ScopedDnsServiceRef.h
+    include/dnssd/bonjour/Service.h
+    include/dnssd/bonjour/SharedConnection.h
+
     src/bonjour/Bonjour.cpp
     src/bonjour/BonjourAdvertiser.cpp
     src/bonjour/BonjourBrowser.cpp
@@ -39,18 +49,37 @@ add_library(dnssd-cpp STATIC
     src/bonjour/ScopedDnsServiceRef.cpp
     src/bonjour/Service.cpp
     src/bonjour/SharedConnection.cpp
-    src/common/Result.cpp
-    src/common/Result.cpp
-    src/common/Log.cpp
 )
+else()
+target_sources(dnssd-cpp PRIVATE
+    include/dnssd/windns/Windns.h
+    include/dnssd/windns/WindnsAdvertiser.h
+    include/dnssd/windns/WindnsBrowser.h
+    include/dnssd/windns/WindnsDiscoveredService.h
+    include/dnssd/windns/WindnsUtil.h
+
+    src/windns/WindnsAdvertiser.cpp
+    src/windns/WindnsBrowser.cpp
+    src/windns/WindnsUtil.cpp
+)
+endif()
 
 target_include_directories(dnssd-cpp PUBLIC include)
+
+target_compile_definitions(dnssd-cpp PRIVATE 
+    $<$<CONFIG:Debug>:DNSSD_DEBUG>
+)
 
 if (WIN32)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /NODEFAULTLIB:libcmt")
 
-    find_package(BonjourSDK REQUIRED)
-    target_link_libraries(dnssd-cpp PUBLIC Bonjour::dnssd)
+    if (USE_WINDNS)
+        target_link_libraries(dnssd-cpp PRIVATE ws2_32 dnsapi iphlpapi)
+        target_compile_definitions(dnssd-cpp PUBLIC USE_WINDNS UNICODE _UNICODE)
+    else()
+        find_package(BonjourSDK REQUIRED)
+        target_link_libraries(dnssd-cpp PUBLIC Bonjour::dnssd)
+    endif()
 endif ()
 
 if (NOT DNSSD_NO_EXAMPLES)

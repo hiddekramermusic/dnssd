@@ -3,6 +3,7 @@
 #include <utility>
 using namespace dnssd;
 
+#if !USE_WINDNS
 Result::Result (DNSServiceErrorType error) noexcept
 {
     if (error != kDNSServiceErr_NoError)
@@ -14,6 +15,41 @@ Result::Result (DNSServiceErrorType error) noexcept
 
     mError = error;
 }
+#endif
+
+#if USE_WINDNS && _WIN32
+Result::Result (DNS_STATUS error) noexcept
+{
+    if (error != ERROR_SUCCESS && error != DNS_REQUEST_PENDING)
+    {
+        LPSTR messageBuffer = nullptr;
+        const auto status = static_cast<DWORD> (error);
+        DWORD size = FormatMessageA (
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL,
+            status,
+            MAKELANGID (LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPSTR) &messageBuffer,
+            0,
+            NULL);
+
+        if (size > 0 && messageBuffer != nullptr)
+        {
+            std::stringstream errorMessage;
+            errorMessage << "Windns error: (" << messageBuffer << ")";
+            mErrorMsg = errorMessage.str();
+            LocalFree (messageBuffer);
+        }
+        else
+        {
+            std::stringstream message;
+            message << "Windns error: (Unable to format DNS error code: " << error << ")";
+        }
+    }
+
+    mError = error;
+}
+#endif
 
 Result::Result (const std::string& errorMsg) noexcept
 {
@@ -29,6 +65,7 @@ std::string Result::description() const noexcept
     return mErrorMsg;
 }
 
+#if !USE_WINDNS
 const char* Result::DNSServiceErrorDescription (DNSServiceErrorType error) noexcept
 {
     switch (error)
@@ -106,10 +143,15 @@ const char* Result::DNSServiceErrorDescription (DNSServiceErrorType error) noexc
         return "Unknown error";
     }
 }
+#endif
 
 bool Result::hasError() const
 {
+#if USE_WINDNS
+    return mError != 0 || !mErrorMsg.empty();
+#else
     return mError != kDNSServiceErr_NoError || !mErrorMsg.empty();
+#endif
 }
 
 bool Result::isOk() const
