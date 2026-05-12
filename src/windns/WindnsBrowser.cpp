@@ -276,6 +276,13 @@ VOID WINAPI WindnsBrowser::resolveCallback (DWORD Status, PVOID pQueryContext, P
 
     it->second.resolveFinished = true;
 
+    if (static_cast<DNS_STATUS> (Status) == ERROR_CANCELLED)
+    {
+        if (pInstance != nullptr)
+            DnsServiceFreeInstance (pInstance);
+        return;
+    }
+
     if (self->reportIfError (Result (static_cast<DNS_STATUS> (Status))))
     {
         DNSSD_LOG_DEBUG ("- resolveCallback: resolve failed for " << instanceName << std::endl)
@@ -312,7 +319,8 @@ VOID WINAPI WindnsBrowser::aQueryCallback (PVOID pQueryContext, PDNS_QUERY_RESUL
 
     if (pQueryResults == nullptr || pQueryResults->QueryStatus != ERROR_SUCCESS)
     {
-        if (pQueryResults != nullptr && it != self->mServices.end())
+        if (pQueryResults != nullptr && it != self->mServices.end()
+            && static_cast<DNS_STATUS> (pQueryResults->QueryStatus) != ERROR_CANCELLED)
             self->reportIfError (Result (static_cast<DNS_STATUS> (pQueryResults->QueryStatus)));
         delete ctx;
         return;
@@ -349,7 +357,8 @@ VOID WINAPI WindnsBrowser::aaaaQueryCallback (PVOID pQueryContext, PDNS_QUERY_RE
 
     if (pQueryResults == nullptr || pQueryResults->QueryStatus != ERROR_SUCCESS)
     {
-        if (pQueryResults != nullptr && it != self->mServices.end())
+        if (pQueryResults != nullptr && it != self->mServices.end()
+            && static_cast<DNS_STATUS> (pQueryResults->QueryStatus) != ERROR_CANCELLED)
             self->reportIfError (Result (static_cast<DNS_STATUS> (pQueryResults->QueryStatus)));
         delete ctx;
         return;

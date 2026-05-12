@@ -49,6 +49,7 @@ dnssd::Result doRegister (
         return dnssd::Result (msg.str());
     }
     hostname.resize (bufferSize); // trim null terminator written by the API
+    hostname += L".local";
 
     // Build TXT record key/value arrays.
     // wstrings must stay alive until DnsServiceConstructInstance returns.
@@ -171,7 +172,7 @@ Result WindnsAdvertiser::registerService (
     std::wstring regTypeW;
     auto r = dnssd::toWideString (regType, regTypeW);
     if (r.hasError()) return r;
-    instanceName += L"." + regTypeW + L".local";
+    instanceName += L"." + regTypeW + L".local.";
 
     mCtx = { RegisterEventType::Register, this };
     mCallbackPending = true;
