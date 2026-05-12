@@ -112,15 +112,15 @@ Result WindnsBrowser::browseFor (const std::string& serviceType)
     if (mBrowseCancels.count (queryName) > 0)
         return Result ("already browsing for service \"" + serviceType + "\"");
 
-    // Emplace now so the map key — which DnsServiceBrowse holds as QueryName — has a stable address.
-    auto it = mBrowseCancels.emplace (queryName, DNS_SERVICE_CANCEL {}).first;
 
     DNS_SERVICE_BROWSE_REQUEST req {};
     req.Version = DNS_QUERY_REQUEST_VERSION1;
     req.InterfaceIndex = 0; // all interfaces
-    req.QueryName = it->first.c_str();
+    req.QueryName = queryName.c_str();
     req.pBrowseCallback = &WindnsBrowser::browseCallback;
     req.pQueryContext = this;
+
+    auto& it = mBrowseCancels.emplace (queryName, DNS_SERVICE_CANCEL {}).first;
 
     DWORD status = DnsServiceBrowse (&req, &it->second);
 
