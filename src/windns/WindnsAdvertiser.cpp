@@ -334,7 +334,7 @@ VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQue
     if (auto* owner = static_cast<dnssd::WindnsAdvertiser*> (ctx->owner))
         owner->onCallbackFinished();
 
-    DNSSD_LOG_DEBUG ("> registerCompleteCallback exit" << std::endl);
+    DNSSD_LOG_DEBUG ("< registerCompleteCallback exit" << std::endl);
 }
 
 void WindnsAdvertiser::onCallbackFinished()

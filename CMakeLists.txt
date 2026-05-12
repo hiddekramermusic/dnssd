@@ -75,7 +75,7 @@ if (WIN32)
 
     if (USE_WINDNS)
         target_link_libraries(dnssd-cpp PRIVATE ws2_32 dnsapi iphlpapi)
-        target_compile_definitions(dnssd-cpp PUBLIC USE_WINDNS)
+        target_compile_definitions(dnssd-cpp PUBLIC USE_WINDNS UNICODE _UNICODE)
     else()
         find_package(BonjourSDK REQUIRED)
         target_link_libraries(dnssd-cpp PUBLIC Bonjour::dnssd)

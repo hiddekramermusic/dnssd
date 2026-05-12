@@ -26,7 +26,10 @@ bool parseInstanceName (
     const std::string localSuffix = ".local";
     const auto localPos = instanceName.rfind (localSuffix);
     if (localPos == std::string::npos || localPos == 0)
+    {
+        DNSSD_LOG_DEBUG ("instance name does not end in .local: " << instanceName << std::endl);
         return false;
+    }
 
     // Everything before ".local": "<name>._type._proto"
     const std::string nameAndType = instanceName.substr (0, localPos);
@@ -169,7 +172,18 @@ VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PD
         if (record->wType != DNS_TYPE_PTR)
             continue;
 
-        const std::string instanceName (static_cast<const char*> (record->Data.PTR.pNameHost));
+        if (record->Data.PTR.pNameHost == nullptr)
+        {
+            DNSSD_LOG_DEBUG ("- browseCallback: host name string was nullptr" << std::endl);
+            continue;
+        }
+
+        std::string instanceName;
+        if (toNarrowString (record->Data.PTR.pNameHost, instanceName).hasError())
+        {
+            DNSSD_LOG_DEBUG ("- browseCallback: failed to convert instance name" << std::endl);
+            continue;
+        }
 
         if (record->dwTtl == 0)
         {
