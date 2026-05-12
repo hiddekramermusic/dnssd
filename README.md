@@ -106,15 +106,16 @@ dnssd::Browser browser;
 browser.setTxtPollIntervalMs(2000); // re-resolve every 2 seconds; 0 = disabled (default)
 browser.browseFor("_http._tcp");
 ```
-Choose the interval based on how quickly you need to detect changes.
+Choose the interval based on how quickly you need to detect changes, and based on the performance you get.
 
 If you do not use this polling loop, Bonjour updates the PTR record at a higher interval (30 seconds or more), and at that point any updated TXT records will be found by the Windns browser. 
-However, in many applications this wait would be too long.
 
-### CMake building with Windns and TXT polling loop in the browser example
+### TXT polling in the browser example (WinDNS)
 
-Here is an example CMake command for building with WIN_DNS enabled and with the TXT record polling loop enabled in the browser example: 
+Build with Windns enabled, then pass `polling_interval=<ms>` on the command line:
 
 ```bash
-cmake -B build -S . -DUSE_WINDNS=ON -DDNSSD_BROWSER_TXT_POLL_INTERVAL_MS=1000
+cmake -B build -S . -DUSE_WINDNS=ON
+cmake --build build
+.\build\dnssd-browser.exe _http._tcp polling_interval=1000
 ```

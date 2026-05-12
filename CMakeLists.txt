@@ -88,9 +88,4 @@ if (NOT DNSSD_NO_EXAMPLES)
 
     add_executable(dnssd-browser examples/dnssd-browser.cpp)
     target_link_libraries(dnssd-browser dnssd-cpp)
-
-    set(DNSSD_BROWSER_TXT_POLL_INTERVAL_MS 0 CACHE STRING
-        "TXT record poll interval for the browser example in milliseconds (0 = disabled, WinDNS only)")
-    target_compile_definitions(dnssd-browser PRIVATE
-        DNSSD_BROWSER_TXT_POLL_INTERVAL_MS=${DNSSD_BROWSER_TXT_POLL_INTERVAL_MS})
 endif ()

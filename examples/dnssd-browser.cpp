@@ -12,6 +12,23 @@ int main (int argc, char* argv[])
         return -1;
     }
 
+    int pollingIntervalMs = 0;
+    for (int i = 2; i < argc; ++i)
+    {
+        std::string arg (argv[i]);
+        const std::string prefix = "polling_interval=";
+        if (arg.substr (0, prefix.size()) == prefix)
+        {
+            try
+            {
+                pollingIntervalMs = std::stoi (arg.substr (prefix.size()));
+            }
+            catch (...)
+            {
+            }
+        }
+    }
+
     dnssd::Browser browser;
 
     browser.onServiceDiscovered ([] (const dnssd::ServiceDescription& serviceDescription) {
@@ -40,8 +57,8 @@ int main (int argc, char* argv[])
         std::cout << "Error: " << error.description() << std::endl;
     });
 
-#if defined(_WIN32) && defined(USE_WINDNS) && DNSSD_BROWSER_TXT_POLL_INTERVAL_MS > 0
-    browser.setTxtPollIntervalMs (DNSSD_BROWSER_TXT_POLL_INTERVAL_MS);
+#if defined(_WIN32) && defined(USE_WINDNS)
+    browser.setTxtPollIntervalMs (pollingIntervalMs);
 #endif
 
     auto const result = browser.browseFor (argv[1]);
