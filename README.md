@@ -90,6 +90,10 @@ After this you end up with two test command line utilities and a libray.
 
 ## Windns notes
 
+### Libraries to link for Windns
+
+You need to link the following libraries on windows to use Windns: ws2_32.lib dnsapi.lib iphlpapi.lib
+
 ### TXT record update broadcasting (advertiser)
 Windns has some slight differences compared to Bonjour in how they handle updating records, as dynamic record updates are not supported.
 Instead, this library deregisters the current service, and reregisters the service with the new TXT record.
