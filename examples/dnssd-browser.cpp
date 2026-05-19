@@ -12,6 +12,7 @@ int main (int argc, char* argv[])
         return -1;
     }
 
+#if defined(_WIN32) && defined(USE_WINDNS)
     int pollingIntervalMs = 0;
     for (int i = 2; i < argc; ++i)
     {
@@ -31,6 +32,7 @@ int main (int argc, char* argv[])
             }
         }
     }
+#endif
 
     dnssd::Browser browser;
 
