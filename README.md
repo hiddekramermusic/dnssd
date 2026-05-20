@@ -113,13 +113,3 @@ browser.browseFor("_http._tcp");
 Choose the interval based on how quickly you need to detect changes, and based on the performance you get.
 
 If you do not use this polling loop, Bonjour updates the PTR record at a higher interval (30 seconds or more), and at that point any updated TXT records will be found by the Windns browser. 
-
-### TXT polling in the browser example (WinDNS)
-
-Build with Windns enabled, then pass `polling_interval=<ms>` on the command line:
-
-```bash
-cmake -B build -S . -DUSE_WINDNS=ON
-cmake --build build
-.\build\dnssd-browser.exe _http._tcp polling_interval=1000
-```
