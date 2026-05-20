@@ -1,0 +1,1 @@
+/usr/bin/c++ "CMakeFiles/dnssd-advertiser.dir/examples/dnssd-advertiser.cpp.o" -o dnssd-advertiser  libdnssd-cpp.a /usr/lib/aarch64-linux-gnu/libavahi-common.so /usr/lib/aarch64-linux-gnu/libavahi-client.so 

@@ -29,8 +29,27 @@ private:
         std::string serviceType;
     };
 
+    struct ServiceInstance {
+        std::string name;
+        std::string type;
+        std::string domain;
+        AvahiIfIndex interface;
+        AvahiProtocol protocol;
+        AvahiServiceResolver* resolver = nullptr;
+        ServiceDescription description;
+
+        bool operator<(const ServiceInstance& other) const {
+            if (name != other.name) return name < other.name;
+            if (type != other.type) return type < other.type;
+            if (domain != other.domain) return domain < other.domain;
+            if (interface != other.interface) return interface < other.interface;
+            return protocol < other.protocol;
+        }
+    };
+
     std::map<std::string, AvahiServiceBrowser*> mBrowsers;
     std::vector<BrowserContext*> mContexts;
+    std::map<ServiceInstance, ServiceInstance> mInstances;
 
     std::thread mThread;
     std::atomic<bool> mStopThread { false };

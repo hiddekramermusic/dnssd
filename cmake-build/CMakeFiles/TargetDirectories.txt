@@ -1,0 +1,5 @@
+/home/parallels/dev/dnssd/cmake-build/CMakeFiles/dnssd-cpp.dir
+/home/parallels/dev/dnssd/cmake-build/CMakeFiles/dnssd-advertiser.dir
+/home/parallels/dev/dnssd/cmake-build/CMakeFiles/dnssd-browser.dir
+/home/parallels/dev/dnssd/cmake-build/CMakeFiles/edit_cache.dir
+/home/parallels/dev/dnssd/cmake-build/CMakeFiles/rebuild_cache.dir

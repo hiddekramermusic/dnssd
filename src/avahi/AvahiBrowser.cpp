@@ -46,6 +46,14 @@ AvahiBrowser::~AvahiBrowser()
         avahi_service_browser_free (pair.second);
     }
 
+    for (auto& pair : mInstances)
+    {
+        if (pair.second.resolver)
+        {
+            avahi_service_resolver_free (pair.second.resolver);
+        }
+    }
+
     for (auto context : mContexts)
     {
         delete context;
@@ -125,27 +133,45 @@ void AvahiBrowser::browseCallback (
     {
         case AVAHI_BROWSER_NEW:
         {
-            if (self->onServiceDiscoveredCallback)
+            ServiceInstance instance;
+            instance.name = name;
+            instance.type = type;
+            instance.domain = domain;
+            instance.interface = interface;
+            instance.protocol = protocol;
+            instance.description.name = name;
+            instance.description.type = type;
+            instance.description.domain = domain;
+
+            std::lock_guard<std::mutex> lock (self->mMutex);
+            if (self->mInstances.find (instance) != self->mInstances.end())
             {
-                ServiceDescription description;
-                description.name = name;
-                description.type = type;
-                description.domain = domain;
-                self->onServiceDiscoveredCallback (description);
+                break;
             }
 
-            // Start resolver
-            if (!avahi_service_resolver_new (
-                    avahi_service_browser_get_client (b),
-                    interface,
-                    protocol,
-                    name,
-                    type,
-                    domain,
-                    AVAHI_PROTO_UNSPEC,
-                    static_cast<AvahiLookupFlags> (0),
-                    resolveCallback,
-                    self))
+            if (self->onServiceDiscoveredCallback)
+            {
+                self->onServiceDiscoveredCallback (instance.description);
+            }
+
+            // Start persistent resolver
+            instance.resolver = avahi_service_resolver_new (
+                avahi_service_browser_get_client (b),
+                interface,
+                protocol,
+                name,
+                type,
+                domain,
+                AVAHI_PROTO_UNSPEC,
+                static_cast<AvahiLookupFlags> (0),
+                resolveCallback,
+                self);
+
+            if (instance.resolver)
+            {
+                self->mInstances[instance] = instance;
+            }
+            else
             {
                 DNSSD_LOG_DEBUG ("Failed to create resolver: " << avahi_strerror (avahi_client_errno (avahi_service_browser_get_client (b))));
             }
@@ -153,15 +179,27 @@ void AvahiBrowser::browseCallback (
         }
 
         case AVAHI_BROWSER_REMOVE:
-            if (self->onServiceRemovedCallback)
+        {
+            ServiceInstance instance;
+            instance.name = name;
+            instance.type = type;
+            instance.domain = domain;
+            instance.interface = interface;
+            instance.protocol = protocol;
+
+            std::lock_guard<std::mutex> lock (self->mMutex);
+            auto it = self->mInstances.find (instance);
+            if (it != self->mInstances.end())
             {
-                ServiceDescription description;
-                description.name = name;
-                description.type = type;
-                description.domain = domain;
-                self->onServiceRemovedCallback (description);
+                if (self->onServiceRemovedCallback)
+                {
+                    self->onServiceRemovedCallback (it->second.description);
+                }
+                avahi_service_resolver_free (it->second.resolver);
+                self->mInstances.erase (it);
             }
             break;
+        }
 
         case AVAHI_BROWSER_FAILURE:
             if (self->onBrowseErrorCallback)
@@ -195,34 +233,46 @@ void AvahiBrowser::resolveCallback (
     if (event == AVAHI_RESOLVER_FAILURE)
     {
         DNSSD_LOG_DEBUG ("Resolver failure: " << avahi_strerror (avahi_client_errno (avahi_service_resolver_get_client (r))));
-        avahi_service_resolver_free (r);
         return;
     }
 
-    ServiceDescription description;
-    description.name = name;
-    description.type = type;
-    description.domain = domain;
+    std::lock_guard<std::mutex> lock (self->mMutex);
+    ServiceInstance key;
+    key.name = name;
+    key.type = type;
+    key.domain = domain;
+    key.interface = interface;
+    key.protocol = protocol;
+
+    auto it = self->mInstances.find (key);
+    if (it == self->mInstances.end())
+    {
+        return;
+    }
+
+    ServiceDescription& description = it->second.description;
     description.hostTarget = host_name;
     description.port = port;
 
     TxtRecord txtRecord;
     for (AvahiStringList* i = txt; i; i = avahi_string_list_get_next (i))
     {
-        char* key;
-        char* value;
+        char* k;
+        char* v;
         size_t size;
 
-        if (avahi_string_list_get_pair (i, &key, &value, &size) == 0)
+        if (avahi_string_list_get_pair (i, &k, &v, &size) == 0)
         {
-            txtRecord[key] = std::string (value, size);
-            avahi_free (key);
-            avahi_free (value);
+            txtRecord[k] = std::string (v, size);
+            avahi_free (k);
+            avahi_free (v);
         }
     }
+
+    bool txtChanged = (description.txtRecord != txtRecord);
     description.txtRecord = txtRecord;
 
-    if (self->onServiceResolvedCallback)
+    if (self->onServiceResolvedCallback && (txtChanged || (flags & AVAHI_LOOKUP_RESULT_CACHED) == 0))
     {
         self->onServiceResolvedCallback (description, static_cast<uint32_t> (interface));
     }
@@ -231,10 +281,14 @@ void AvahiBrowser::resolveCallback (
     {
         char addr[AVAHI_ADDRESS_STR_MAX];
         avahi_address_snprint (addr, sizeof (addr), a);
-        self->onAddressAddedCallback (description, addr, static_cast<uint32_t> (interface));
-    }
 
-    avahi_service_resolver_free (r);
+        auto& interfaceAddresses = description.interfaces[static_cast<uint32_t> (interface)];
+        if (interfaceAddresses.find (addr) == interfaceAddresses.end())
+        {
+            interfaceAddresses.insert (addr);
+            self->onAddressAddedCallback (description, addr, static_cast<uint32_t> (interface));
+        }
+    }
 }
 
 void AvahiBrowser::threadLoop()
