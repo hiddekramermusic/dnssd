@@ -4,6 +4,7 @@ project(dnssd-cpp VERSION 0.0.1)
 
 option(DNSSD_NO_EXAMPLES "Disable examples" OFF)
 option(USE_WINDNS "Use Windns.h API instead of Bonjour on Windows" OFF)
+option(USE_AVAHI "Use Avahi API instead of Bonjour" OFF)
 
 if (WIN32)
     if (NOT BONJOUR_SDK_ROOT AND NOT USE_WINDNS)
@@ -33,7 +34,7 @@ add_library(dnssd-cpp STATIC
     src/common/Log.cpp
 )
 
-if (NOT (WIN32 AND USE_WINDNS))
+if (NOT (WIN32 AND USE_WINDNS) AND NOT USE_AVAHI)
 target_sources(dnssd-cpp PRIVATE
     include/dnssd/bonjour/Bonjour.h
     include/dnssd/bonjour/BonjourAdvertiser.h
@@ -49,6 +50,15 @@ target_sources(dnssd-cpp PRIVATE
     src/bonjour/ScopedDnsServiceRef.cpp
     src/bonjour/Service.cpp
     src/bonjour/SharedConnection.cpp
+)
+elseif(USE_AVAHI)
+target_sources(dnssd-cpp PRIVATE
+    include/dnssd/avahi/Avahi.h
+    include/dnssd/avahi/AvahiAdvertiser.h
+    include/dnssd/avahi/AvahiBrowser.h
+
+    src/avahi/AvahiAdvertiser.cpp
+    src/avahi/AvahiBrowser.cpp
 )
 else()
 target_sources(dnssd-cpp PRIVATE
@@ -80,6 +90,10 @@ if (WIN32)
         find_package(BonjourSDK REQUIRED)
         target_link_libraries(dnssd-cpp PUBLIC Bonjour::dnssd)
     endif()
+elseif(USE_AVAHI)
+    find_package(Avahi REQUIRED)
+    target_link_libraries(dnssd-cpp PUBLIC Avahi::Avahi)
+    target_compile_definitions(dnssd-cpp PUBLIC USE_AVAHI)
 endif ()
 
 if (NOT DNSSD_NO_EXAMPLES)
