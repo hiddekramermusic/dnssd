@@ -16,7 +16,7 @@ AvahiBrowser::AvahiBrowser()
     }
 
     int error;
-    mClient = avahi_client_new (avahi_simple_poll_get (mSimplePoll), AVAHI_CLIENT_NO_FLAGS, clientCallback, this, &error);
+    mClient = avahi_client_new (avahi_simple_poll_get (mSimplePoll), static_cast<AvahiClientFlags> (0), clientCallback, this, &error);
 
     if (!mClient)
     {
@@ -127,7 +127,11 @@ void AvahiBrowser::browseCallback (
         {
             if (self->onServiceDiscoveredCallback)
             {
-                self->onServiceDiscoveredCallback ({ name, type, domain });
+                ServiceDescription description;
+                description.name = name;
+                description.type = type;
+                description.domain = domain;
+                self->onServiceDiscoveredCallback (description);
             }
 
             // Start resolver
@@ -151,7 +155,11 @@ void AvahiBrowser::browseCallback (
         case AVAHI_BROWSER_REMOVE:
             if (self->onServiceRemovedCallback)
             {
-                self->onServiceRemovedCallback ({ name, type, domain });
+                ServiceDescription description;
+                description.name = name;
+                description.type = type;
+                description.domain = domain;
+                self->onServiceRemovedCallback (description);
             }
             break;
 
@@ -191,9 +199,12 @@ void AvahiBrowser::resolveCallback (
         return;
     }
 
-    ServiceDescription description (name, type, domain);
-    description.setHostTarget (host_name);
-    description.setPort (port);
+    ServiceDescription description;
+    description.name = name;
+    description.type = type;
+    description.domain = domain;
+    description.hostTarget = host_name;
+    description.port = port;
 
     TxtRecord txtRecord;
     for (AvahiStringList* i = txt; i; i = avahi_string_list_get_next (i))
@@ -209,7 +220,7 @@ void AvahiBrowser::resolveCallback (
             avahi_free (value);
         }
     }
-    description.setTxtRecord (txtRecord);
+    description.txtRecord = txtRecord;
 
     if (self->onServiceResolvedCallback)
     {

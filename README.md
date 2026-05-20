@@ -11,6 +11,12 @@ This library provides an interface which allows to use dns-sd in an easy way.
   
 * XCode
 
+### Linux
+
+* Avahi - Native DNS-SD support for Linux.
+  * Ubuntu/Debian: `sudo apt-get install libavahi-client-dev libavahi-common-dev`
+  * Fedora/RHEL/CentOS: `sudo dnf install avahi-devel`
+
 ### Windows
 
 This library can either use the builtin Windns.h headers, or use the Bonjour SDK by Apple.
@@ -84,6 +90,15 @@ If you don't use CMake for building then this way will produce a separate librar
     mkdir build 
     cd build
     cmake ..
+    cmake --build .
+
+### Linux (Avahi)
+
+To build with Avahi support on Linux:
+
+    mkdir build
+    cd build
+    cmake .. -DUSE_AVAHI=ON
     cmake --build .
     
 After this you end up with two test command line utilities and a libray.

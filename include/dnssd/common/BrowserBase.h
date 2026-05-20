@@ -4,9 +4,9 @@
 #include "Result.h"
 
 // Service accesses protected callback members directly through its BonjourBrowser owner reference.
-// WinDNS has no equivalent: WindnsBrowser handles resolution internally as a derived class,
-// so its methods can access the protected members without friendship.
-#if !_WIN32 || !USE_WINDNS
+// WinDNS and Avahi handle resolution internally as derived classes,
+// so their methods can access the protected members without friendship.
+#if (!_WIN32 || !USE_WINDNS) && !USE_AVAHI
 #include "dnssd/bonjour/Service.h"
 #endif
 
@@ -104,7 +104,7 @@ public:
     }
 
 protected:
-#if !_WIN32 || !USE_WINDNS
+#if (!_WIN32 || !USE_WINDNS) && !USE_AVAHI
     friend Service;
 #endif
 

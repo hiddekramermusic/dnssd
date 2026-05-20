@@ -34,11 +34,7 @@ inline AvahiStringList* txtRecordToAvahiStringList (const TxtRecord& txtRecord)
  */
 inline Result avahiErrorToResult (int error)
 {
-    if (error == AVAHI_OK)
-    {
-        return { Result::Code::NoError };
-    }
-    return { Result::Code::UnknownError, avahi_strerror (error) };
+    return Result (error);
 }
 
 } // namespace dnssd

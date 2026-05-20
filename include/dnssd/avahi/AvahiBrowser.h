@@ -4,6 +4,7 @@
 #include "dnssd/common/BrowserBase.h"
 
 #include <map>
+#include <vector>
 #include <mutex>
 #include <thread>
 #include <atomic>

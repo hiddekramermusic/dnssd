@@ -16,7 +16,7 @@ AvahiAdvertiser::AvahiAdvertiser()
     }
 
     int error;
-    mClient = avahi_client_new (avahi_simple_poll_get (mSimplePoll), AVAHI_CLIENT_NO_FLAGS, clientCallback, this, &error);
+    mClient = avahi_client_new (avahi_simple_poll_get (mSimplePoll), static_cast<AvahiClientFlags> (0), clientCallback, this, &error);
 
     if (!mClient)
     {
@@ -90,7 +90,7 @@ Result AvahiAdvertiser::updateTxtRecord (const TxtRecord& txtRecord)
     }
 
     AvahiStringList* txtList = txtRecordToAvahiStringList (mTxtRecord);
-    int error = avahi_entry_group_update_service_txt_strlist (
+    int error = avahi_entry_group_update_service_txt_strlst (
         mEntryGroup,
         AVAHI_IF_UNSPEC,
         AVAHI_PROTO_UNSPEC,
@@ -205,7 +205,7 @@ void AvahiAdvertiser::createService()
     {
         AvahiStringList* txtList = txtRecordToAvahiStringList (mTxtRecord);
 
-        int error = avahi_entry_group_add_service_strlist (
+        int error = avahi_entry_group_add_service_strlst (
             mEntryGroup,
             AVAHI_IF_UNSPEC,
             AVAHI_PROTO_UNSPEC,

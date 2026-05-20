@@ -1,9 +1,12 @@
 #include <dnssd/common/Result.h>
+#if USE_AVAHI
+#include <avahi-common/error.h>
+#endif
 #include <sstream>
 #include <utility>
 using namespace dnssd;
 
-#if !USE_WINDNS
+#if !USE_WINDNS && !USE_AVAHI
 Result::Result (DNSServiceErrorType error) noexcept
 {
     if (error != kDNSServiceErr_NoError)
@@ -11,8 +14,21 @@ Result::Result (DNSServiceErrorType error) noexcept
         std::stringstream errorMessage;
         errorMessage << "DNSServiceError: (" << Result::DNSServiceErrorDescription (error) << ")";
         mErrorMsg = errorMessage.str();
+        mCode = Code::UnknownError;
     }
 
+    mError = error;
+}
+#endif
+
+#if USE_AVAHI
+Result::Result (int error) noexcept
+{
+    if (error != 0) // AVAHI_OK
+    {
+        mErrorMsg = avahi_strerror (error);
+        mCode = Code::UnknownError;
+    }
     mError = error;
 }
 #endif
@@ -65,7 +81,7 @@ std::string Result::description() const noexcept
     return mErrorMsg;
 }
 
-#if !USE_WINDNS
+#if !USE_WINDNS && !USE_AVAHI
 const char* Result::DNSServiceErrorDescription (DNSServiceErrorType error) noexcept
 {
     switch (error)
@@ -147,7 +163,14 @@ const char* Result::DNSServiceErrorDescription (DNSServiceErrorType error) noexc
 
 bool Result::hasError() const
 {
+    if (mCode != Code::NoError)
+    {
+        return true;
+    }
+
 #if USE_WINDNS
+    return mError != 0 || !mErrorMsg.empty();
+#elif USE_AVAHI
     return mError != 0 || !mErrorMsg.empty();
 #else
     return mError != kDNSServiceErr_NoError || !mErrorMsg.empty();
