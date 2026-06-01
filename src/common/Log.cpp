@@ -7,7 +7,7 @@
 
 void dnssd_debug_log (const std::string& str)
 {
-#ifdef _WIN32
+#if _WIN32
     OutputDebugStringA (str.c_str());
 #else
     std::cout << str;

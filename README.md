@@ -13,7 +13,12 @@ This library provides an interface which allows to use dns-sd in an easy way.
 
 ### Windows
 
-* Bonjour SDK (Apple)  
+This library can either use the builtin Windns.h headers, or use the Bonjour SDK by Apple.
+
+By default the Bonjour SDK is selected, but you can switch to Windns by setting 'USE_WINDNS' as a CMake flag.
+In case you're using Windns, you do not need the Bonjour dependency.
+
+* Bonjour SDK (Apple) - If 'USE_WINDNS' is not enabled 
 This library uses the Bonjour SDK and expects it to be in the default install location (ie C:\Program Files\Bonjour SDK).
 
 ## How to use
@@ -82,3 +87,56 @@ If you don't use CMake for building then this way will produce a separate librar
     cmake --build .
     
 After this you end up with two test command line utilities and a libray.
+
+## Windns notes
+
+### Libraries to link for Windns
+
+You need to link the following libraries on windows to use Windns: ws2_32.lib dnsapi.lib iphlpapi.lib
+
+### TXT record update broadcasting (advertiser)
+Windns has some slight differences compared to Bonjour in how they handle updating records, as dynamic record updates are not supported.
+Instead, this library deregisters the current service, and reregisters the service with the new TXT record.
+
+### TXT record update detection (browser)
+
+The Windns API has no record-change subscription mechanism equivalent to Bonjour's `DNSServiceQueryRecord`. As a result, TXT record updates announced by remote peers (e.g. a Bonjour service on macOS) are not detected automatically.
+
+To work around this, `WindnsBrowser` (and the `Browser` example when built with `USE_WINDNS`) provides opt-out (by passing 0 as an interval) periodic re-resolution via `setTxtPollIntervalMs`. 
+When enabled, the browser re-issues `DnsServiceResolve` for every known service at the given interval and fires `onServiceResolved` if the TXT record has changed.
+
+If you use the default constructor of the WindnsBrowser the interval is set to 1000ms, and the background thread is started after you start browsing for a service.
+
+If you want to change it you can either use the constructor, or change the interval on the fly (thread safe).
+
+- Constructor:
+```cpp
+dnssd::Browser browser { 2000 }; // re-resolve every two seconds
+browser.browseFor("_http._tcp");
+```
+
+- On the fly:
+```cpp
+dnssd::Browser browser;
+browser.setTxtPollIntervalMs (2000); // re-resolve every 2 seconds
+browser.browseFor("_http._tcp");
+```
+
+- Disabling: 
+```cpp
+dnssd::Browser browser { 0 };
+browser.browseFor("_http._tcp");
+```
+
+You can stop the background thread at any moment by setting the interval to 0, it will restart if you set any interval above 0:
+```cpp
+dnssd::Browser browser { 2000 };
+browser.browseFor("_http._tcp");
+/// Do some work
+browser.setTxtPollIntervalMs (0); // Stops the background thread
+```
+
+Choose the interval based on how quickly you need to detect changes, and based on the performance you get, 1000 ms is the reasonable default.
+
+If you choose to not use this polling loop, Bonjour updates the PTR record at a higher interval (30 seconds or more),
+and at that point any updated TXT records will be found by the Windns browser through the PTR update. 
