@@ -36,6 +36,15 @@ class WindnsBrowser : public BrowserBase
 {
 public:
     explicit WindnsBrowser() = default;
+
+    /**
+    * Sets up the browser with a custom TXT polling interval, if the interval is 0 the TXT polling loop
+    * is not started - which can save CPU if you don't need the TXT records.
+    * 
+    * @param txtPollIntervalMs - the interval in milliseconds that the TXT polling background thread uses.
+    */
+    explicit WindnsBrowser (uint32_t txtPollIntervalMs) : mTxtPollIntervalMs (txtPollIntervalMs) {};
+
     ~WindnsBrowser() override;
 
     /**
@@ -53,7 +62,11 @@ public:
      * Each poll re-issues DnsServiceResolve for every known service and fires
      * onServiceResolved if the TXT record has changed.
      *
-     * @param intervalMs Poll interval in milliseconds. Pass 0 to disable (default).
+     * You can safely call this method to update the interval for a background thread that's already running.
+     * Either the atomic interval variable is updated and the thread picks it up on the next iteration,
+     * or the thread is torn down when you pass 0 as an interval.
+     *
+     * @param intervalMs Poll interval in milliseconds. Pass 0 to disable or to stop a running thread.
      */
     void setTxtPollIntervalMs (uint32_t intervalMs);
 
@@ -61,7 +74,7 @@ private:
     std::thread mPollThread;
     std::condition_variable mPollCv;
     std::mutex mPollMutex; // used only to satisfy wait_for; does not guard any data
-    uint32_t mTxtPollIntervalMs = 0;
+    std::atomic<uint32_t> mTxtPollIntervalMs = 1000;
     std::atomic<bool> mStopPollThread { false };
 
     /// One cancel handle per browsed service type, keyed by wide-string service type.

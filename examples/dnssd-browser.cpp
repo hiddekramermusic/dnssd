@@ -40,10 +40,6 @@ int main (int argc, char* argv[])
         std::cout << "Error: " << error.description() << std::endl;
     });
 
-#if defined(_WIN32) && defined(USE_WINDNS)
-    browser.setTxtPollIntervalMs (1000);
-#endif
-
     auto const result = browser.browseFor (argv[1]);
     if (result.hasError())
     {

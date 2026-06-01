@@ -102,14 +102,41 @@ Instead, this library deregisters the current service, and reregisters the servi
 
 The Windns API has no record-change subscription mechanism equivalent to Bonjour's `DNSServiceQueryRecord`. As a result, TXT record updates announced by remote peers (e.g. a Bonjour service on macOS) are not detected automatically.
 
-To work around this, `WindnsBrowser` (and the `Browser` example when built with `USE_WINDNS`) provides opt-in periodic re-resolution via `setTxtPollIntervalMs`. 
+To work around this, `WindnsBrowser` (and the `Browser` example when built with `USE_WINDNS`) provides opt-out (by passing 0 as an interval) periodic re-resolution via `setTxtPollIntervalMs`. 
 When enabled, the browser re-issues `DnsServiceResolve` for every known service at the given interval and fires `onServiceResolved` if the TXT record has changed.
 
+If you use the default constructor of the WindnsBrowser the interval is set to 1000ms, and the background thread is started after you start browsing for a service.
+
+If you want to change it you can either use the constructor, or change the interval on the fly (thread safe).
+
+- Constructor:
 ```cpp
-dnssd::Browser browser;
-browser.setTxtPollIntervalMs(2000); // re-resolve every 2 seconds; 0 = disabled (default)
+dnssd::Browser browser { 2000 }; // re-resolve every two seconds
 browser.browseFor("_http._tcp");
 ```
-Choose the interval based on how quickly you need to detect changes, and based on the performance you get.
 
-If you do not use this polling loop, Bonjour updates the PTR record at a higher interval (30 seconds or more), and at that point any updated TXT records will be found by the Windns browser. 
+- On the fly:
+```cpp
+dnssd::Browser browser;
+browser.setTxtPollIntervalMs (2000); // re-resolve every 2 seconds
+browser.browseFor("_http._tcp");
+```
+
+- Disabling: 
+```cpp
+dnssd::Browser browser { 0 };
+browser.browseFor("_http._tcp");
+```
+
+You can stop the background thread at any moment by setting the interval to 0, it will restart if you set any interval above 0:
+```cpp
+dnssd::Browser browser { 2000 };
+browser.browseFor("_http._tcp");
+/// Do some work
+browser.setTxtPollIntervalMs (0); // Stops the background thread
+```
+
+Choose the interval based on how quickly you need to detect changes, and based on the performance you get, 1000 ms is the reasonable default.
+
+If you choose to not use this polling loop, Bonjour updates the PTR record at a higher interval (30 seconds or more),
+and at that point any updated TXT records will be found by the Windns browser through the PTR update. 

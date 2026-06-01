@@ -56,22 +56,31 @@ namespace dnssd
 
 void WindnsBrowser::setTxtPollIntervalMs (uint32_t intervalMs)
 {
-    mTxtPollIntervalMs = intervalMs;
-    if (intervalMs > 0 && !mPollThread.joinable())
+    mTxtPollIntervalMs.store(intervalMs, std::memory_order_release);
+    if (intervalMs > 0 && !mPollThread.joinable()) // start thread if not already running, otherwise just update interval
+    {
         mPollThread = std::thread (&WindnsBrowser::pollLoop, this);
+    }
+    else if (intervalMs == 0 && mPollThread.joinable())
+    {
+        mStopPollThread.store (true, std::memory_order_release);
+        mPollCv.notify_one();
+        mPollThread.join();
+        mStopPollThread.store (false, std::memory_order_release);
+    }
 }
 
 void WindnsBrowser::pollLoop()
 {
-    while (!mStopPollThread)
+    while (!mStopPollThread.load(std::memory_order_acquire))
     {
         {
             std::unique_lock<std::mutex> lk (mPollMutex);
             mPollCv.wait_for (lk, std::chrono::milliseconds (mTxtPollIntervalMs),
-                              [this]() { return mStopPollThread.load(); });
+                              [this]() { return mStopPollThread.load(std::memory_order_acquire); });
         }
 
-        if (mStopPollThread)
+        if (mStopPollThread.load(std::memory_order_acquire))
             break;
 
         std::lock_guard<std::recursive_mutex> lg (mLock);
@@ -180,6 +189,10 @@ Result WindnsBrowser::browseFor (const std::string& serviceType)
     {
         mBrowseCancels.erase (it);
         return Result (static_cast<DNS_STATUS> (status));
+    }
+
+    if (!mPollThread.joinable()) {
+        mPollThread = std::thread (&WindnsBrowser::pollLoop, this);
     }
 
     return {};
