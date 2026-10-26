@@ -18,7 +18,8 @@ namespace {
  * @param ctx - Request context passed to the completion callback.
  * @param req - Register request struct; any existing pServiceInstance is freed and replaced.
  *              Set to nullptr on registration failure.
- * @param cancelHandle - Receives a handle that can be used to cancel the pending registration.
+ * @param cancelHandle - Filled by DnsServiceRegister; pass it to DnsServiceRegisterCancel to cancel the pending
+ *                       registration. Must stay alive until the registration completes or is cancelled.
  * @param callback - Completion callback invoked when registration succeeds or fails.
  * @return Empty Result on success, or an error Result if string conversion or registration failed.
  */
@@ -28,7 +29,7 @@ dnssd::Result doRegister (
     const dnssd::TxtRecord& txtRecord,
     dnssd::WindnsAdvertiser::RegisterRequestContext& ctx,
     DNS_SERVICE_REGISTER_REQUEST& req,
-    PDNS_SERVICE_CANCEL& cancelHandle,
+    DNS_SERVICE_CANCEL& cancelHandle,
     PDNS_SERVICE_REGISTER_COMPLETE callback)
 {
     DWORD bufferSize = 0;
@@ -110,7 +111,8 @@ dnssd::Result doRegister (
     req.hCredentials = nullptr;
     req.unicastEnabled = FALSE;
 
-    DWORD status = DnsServiceRegister (&req, cancelHandle);
+    cancelHandle = {};
+    DWORD status = DnsServiceRegister (&req, &cancelHandle);
     if (status != DNS_REQUEST_PENDING && status != ERROR_SUCCESS)
     {
         DnsServiceFreeInstance (instance);
@@ -136,7 +138,7 @@ Result WindnsAdvertiser::registerService (
     if (domain != nullptr)
         return Result ("Windns does not support other domain names than '.local', you need to leave the domain parameter as a nullptr");
 
-    if (mRegistered.load (std::memory_order_acquire))
+    if (mRegistered.load (std::memory_order_acquire) || isRegistrationPending())
         return Result ("Service already registered, unregister first or use updateTxtRecord function to update an existing service");
 
     mTxtRecord = txtRecord;
@@ -174,8 +176,11 @@ Result WindnsAdvertiser::registerService (
     if (r.hasError()) return r;
     instanceName += L"." + regTypeW + L".local.";
 
-    mCtx = { RegisterEventType::Register, this };
-    mCallbackPending = true;
+    {
+        std::lock_guard<std::mutex> lockGuard (mLock);
+        mCtx = { RegisterEventType::Register, this };
+        mCallbackPending = true;
+    }
 
     Result result = doRegister (
         instanceName.c_str(),
@@ -183,11 +188,14 @@ Result WindnsAdvertiser::registerService (
         txtRecord,
         mCtx,
         mReq,
-        mCancelPtr,
+        mRegisterCancel,
         registerCompleteCallback);
 
     if (result.hasError())
+    {
+        std::lock_guard<std::mutex> lockGuard (mLock);
         mCallbackPending = false;
+    }
 
     return result;
 }
@@ -196,79 +204,110 @@ Result WindnsAdvertiser::updateTxtRecord (const TxtRecord& txtRecord)
 {
     mTxtRecord = txtRecord;
 
-    if (!mRegistered.load (std::memory_order_acquire))
+    if (!mRegistered.load (std::memory_order_acquire) && !isRegistrationPending())
         return {};
 
-    // WinDNS has no in-place TXT update API; deregister and re-register.
-    // Copy the existing instance name and port before unregisterService frees the instance.
+    if (mReq.pServiceInstance == nullptr)
+        return Result ("Failed to update TXT record: no service instance");
+
+    // WinDNS has no in-place TXT update API; deregister (or cancel the pending registration) and re-register.
+    // Copy the existing instance name and port before doRegister frees the instance.
     std::wstring instanceName (mReq.pServiceInstance->pszInstanceName);
     uint16_t port = mReq.pServiceInstance->wPort;
 
     unregisterService();
 
-    mCtx = { RegisterEventType::Register, this };
-    mCallbackPending = true;
+    if (mRegistered.load (std::memory_order_acquire) || isRegistrationPending())
+        return Result ("Failed to update TXT record: the existing service could not be unregistered");
 
-    Result result = doRegister (instanceName.c_str(), port, txtRecord, mCtx, mReq, mCancelPtr, registerCompleteCallback);
+    {
+        std::lock_guard<std::mutex> lockGuard (mLock);
+        mCtx = { RegisterEventType::Register, this };
+        mCallbackPending = true;
+    }
+
+    Result result = doRegister (instanceName.c_str(), port, txtRecord, mCtx, mReq, mRegisterCancel, registerCompleteCallback);
 
     if (result.hasError())
+    {
+        std::lock_guard<std::mutex> lockGuard (mLock);
         mCallbackPending = false;
+    }
 
     return result;
 }
 
 void WindnsAdvertiser::unregisterService() noexcept
 {
+    if (isRegistrationPending())
+        cancelPendingRegistration();
+
     if (!mRegistered.load (std::memory_order_acquire))
         return;
 
-    mCtx.event_type = RegisterEventType::Deregister;
-    mCallbackFinished = false;
-    mCallbackPending = true;
-
-    DWORD status = DnsServiceDeRegister (&mReq, nullptr);
-
-    if (status == DNS_REQUEST_PENDING)
     {
-        std::unique_lock<std::mutex> lock (mLock);
-        bool completed = mCv.wait_for (lock, kWindnsCallbackTimeout, [this]() { return mCallbackFinished; });
-        if (!completed)
-            DNSSD_LOG_DEBUG ("WindnsAdvertiser::unregisterService: timed out waiting for deregister callback" << std::endl)
+        std::lock_guard<std::mutex> lockGuard (mLock);
+        mCtx.event_type = RegisterEventType::Deregister;
+        mCallbackPending = true;
     }
+
+    DWORD status = DnsServiceDeRegister (&mReq, nullptr); // pCancel must be nullptr
+
+    if (status != DNS_REQUEST_PENDING)
+    {
+        {
+            std::lock_guard<std::mutex> lockGuard (mLock);
+            mCallbackPending = false;
+        }
+
+        std::stringstream message;
+        message << "Deregistering DNS Service failed: " << Result (static_cast<DNS_STATUS> (status)).description();
+        DNSSD_LOG_DEBUG (message.str() << std::endl)
+
+        if (onAdvertiserErrorCallback)
+            onAdvertiserErrorCallback (Result (message.str()));
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock (mLock);
+    bool completed = mCv.wait_for (lock, kWindnsCallbackTimeout, [this]() { return !mCallbackPending; });
+    if (!completed)
+        DNSSD_LOG_DEBUG ("WindnsAdvertiser::unregisterService: timed out waiting for deregister callback" << std::endl)
+}
+
+bool WindnsAdvertiser::isRegistrationPending()
+{
+    std::lock_guard<std::mutex> lockGuard (mLock);
+    return mCallbackPending && mCtx.event_type == RegisterEventType::Register;
+}
+
+void WindnsAdvertiser::cancelPendingRegistration() noexcept
+{
+    DWORD res = DnsServiceRegisterCancel (&mRegisterCancel);
+
+    if (res == ERROR_SUCCESS || res == ERROR_CANCELLED)
+    {
+        // Cancelled synchronously. registerCompleteCallback ignores ERROR_CANCELLED, so don't wait for it.
+        std::lock_guard<std::mutex> lockGuard (mLock);
+        mCallbackPending = false;
+        return;
+    }
+
+    DNSSD_LOG_DEBUG ("WindnsAdvertiser::cancelPendingRegistration: DnsServiceRegisterCancel failed: ("
+                     << res << ") " << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
+
+    // The registration was not cancelled, so its callback can still arrive. Wait for it, so that the caller
+    // can see whether the service ended up registered and deregister it.
+    std::unique_lock<std::mutex> lock (mLock);
+    bool completed = mCv.wait_for (lock, kWindnsCallbackTimeout, [this]() { return !mCallbackPending; });
+    if (!completed)
+        DNSSD_LOG_DEBUG ("WindnsAdvertiser::cancelPendingRegistration: timed out waiting for register callback" << std::endl)
 }
 
 WindnsAdvertiser::~WindnsAdvertiser()
 {
-    if (mCallbackPending)
-    {
-        if (mCtx.event_type == RegisterEventType::Register)
-        {
-            DWORD res = DnsServiceRegisterCancel (mCancelPtr);
-            if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-            {
-                std::string descriptive_error = dnssd::Result (res).description();
-                std::stringstream message;
-                message << "WindnsAdvertiser::~WindnsAdvertiser() : Cancelling registration of DNS service failed with "
-                           "status: ("
-                        << res << ") and description: (" << descriptive_error << ")";
-                DNSSD_LOG_DEBUG (message.str());
-            }
-        }
-    }
-    else if (mRegistered)
-    {
-        mCallbackFinished = false;
-        mCallbackPending = true;
-        DWORD status = DnsServiceDeRegister (&mReq, mCancelPtr);
-
-        if (status == DNS_REQUEST_PENDING)
-        {
-            std::unique_lock<std::mutex> lock (mLock);
-            bool completed = mCv.wait_for (lock, kWindnsCallbackTimeout, [this]() { return mCallbackFinished; });
-            if (!completed)
-                DNSSD_LOG_DEBUG ("WindnsAdvertiser::~WindnsAdvertiser: timed out waiting for deregister callback" << std::endl)
-        }
-    }
+    // Cancels a pending registration, or deregisters and waits for the deregister callback.
+    unregisterService();
 
     if (mReq.pServiceInstance != nullptr)
     {
@@ -279,6 +318,11 @@ WindnsAdvertiser::~WindnsAdvertiser()
 
 VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQueryContext, PDNS_SERVICE_INSTANCE pInstance)
 {
+    // A registration cancelled with DnsServiceRegisterCancel is not waited on. If WinDNS still calls back for it,
+    // the context may already belong to a newer request or to a destroyed advertiser, so don't touch it.
+    if (Status == ERROR_CANCELLED)
+        return;
+
     auto* ctx = static_cast<dnssd::WindnsAdvertiser::RegisterRequestContext*> (pQueryContext);
 
     if (ctx == nullptr)
@@ -341,7 +385,6 @@ VOID WINAPI WindnsAdvertiser::registerCompleteCallback (DWORD Status, PVOID pQue
 void WindnsAdvertiser::onCallbackFinished()
 {
     std::lock_guard<std::mutex> lockGuard (mLock);
-    mCallbackFinished = true;
     mCallbackPending = false;
     mCv.notify_one();
 }
