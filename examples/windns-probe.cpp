@@ -96,7 +96,7 @@ std::string typeName (WORD type)
     {
         case DNS_TYPE_PTR: return "PTR";
         case DNS_TYPE_SRV: return "SRV";
-        case DNS_TYPE_TXT: return "TXT";
+        case DNS_TYPE_TEXT: return "TXT";
         case DNS_TYPE_A: return "A";
         case DNS_TYPE_AAAA: return "AAAA";
         default:
@@ -122,7 +122,7 @@ std::string recordText (const DNS_RECORD* r)
         case DNS_TYPE_SRV:
             s << " target=" << narrow (r->Data.SRV.pNameTarget) << " port=" << r->Data.SRV.wPort;
             break;
-        case DNS_TYPE_TXT:
+        case DNS_TYPE_TEXT:
             s << " strings=" << r->Data.TXT.dwStringCount;
             for (DWORD i = 0; i < r->Data.TXT.dwStringCount; ++i)
                 s << " \"" << narrow (r->Data.TXT.pStringArray[i]) << "\"";
@@ -618,7 +618,7 @@ WORD parseType (const std::string& type)
 {
     if (type == "ptr") return DNS_TYPE_PTR;
     if (type == "srv") return DNS_TYPE_SRV;
-    if (type == "txt") return DNS_TYPE_TXT;
+    if (type == "txt") return DNS_TYPE_TEXT;
     if (type == "a") return DNS_TYPE_A;
     if (type == "aaaa") return DNS_TYPE_AAAA;
     return 0;
