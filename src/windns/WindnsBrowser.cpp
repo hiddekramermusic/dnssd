@@ -56,77 +56,178 @@ namespace dnssd
 
 void WindnsBrowser::setTxtPollIntervalMs (uint32_t intervalMs)
 {
-    mTxtPollIntervalMs.store(intervalMs, std::memory_order_release);
-    if (intervalMs > 0 && !mPollThread.joinable()) // start thread if not already running, otherwise just update interval
+    mTxtPollIntervalMs.store (intervalMs, std::memory_order_release);
     {
-        mPollThread = std::thread (&WindnsBrowser::pollLoop, this);
+        std::lock_guard<std::mutex> lk (mPollMutex);
+        mTxtPollIntervalChanged.store (true, std::memory_order_release);
     }
-    else if (intervalMs == 0 && mPollThread.joinable())
-    {
-        mStopPollThread.store (true, std::memory_order_release);
-        mPollCv.notify_one();
-        mPollThread.join();
-        mStopPollThread.store (false, std::memory_order_release);
-    }
+    mPollCv.notify_one();
 }
 
 void WindnsBrowser::pollLoop()
 {
-    while (!mStopPollThread.load(std::memory_order_acquire))
+    using Clock = std::chrono::steady_clock;
+
+    auto nextLiveness = Clock::now() + kLivenessInterval;
+    auto nextTxtPoll = Clock::now() + std::chrono::milliseconds (mTxtPollIntervalMs.load (std::memory_order_acquire));
+
+    while (true)
     {
+        const uint32_t txtIntervalMs = mTxtPollIntervalMs.load (std::memory_order_acquire);
+        const auto wakeAt = (txtIntervalMs > 0 && nextTxtPoll < nextLiveness) ? nextTxtPoll : nextLiveness;
+
         {
             std::unique_lock<std::mutex> lk (mPollMutex);
-            mPollCv.wait_for (lk, std::chrono::milliseconds (mTxtPollIntervalMs),
-                              [this]() { return mStopPollThread.load(std::memory_order_acquire); });
+            mPollCv.wait_until (lk, wakeAt, [this]() {
+                return mStopPollThread.load (std::memory_order_acquire)
+                       || mTxtPollIntervalChanged.load (std::memory_order_acquire);
+            });
         }
 
-        if (mStopPollThread.load(std::memory_order_acquire))
+        if (mStopPollThread.load (std::memory_order_acquire))
             break;
 
-        std::lock_guard<std::recursive_mutex> lg (mLock);
-        for (auto& entry : mServices)
+        const auto now = Clock::now();
+
+        if (mTxtPollIntervalChanged.exchange (false, std::memory_order_acq_rel))
         {
-            WindnsDiscoveredService& service = entry.second;
-            if (service.resolveFinished)
-            {
-                service.resolveFinished = false;
-                issueResolve (entry.first);
-            }
+            nextTxtPoll = now + std::chrono::milliseconds (mTxtPollIntervalMs.load (std::memory_order_acquire));
+            continue;
+        }
+
+        std::lock_guard<std::recursive_mutex> lg (mLock);
+
+        if (now >= nextLiveness)
+        {
+            checkLiveness (now);
+            nextLiveness = now + kLivenessInterval;
+        }
+
+        if (txtIntervalMs > 0 && now >= nextTxtPoll)
+        {
+            pollTxtRecords();
+            nextTxtPoll = now + std::chrono::milliseconds (txtIntervalMs);
         }
     }
 }
 
+void WindnsBrowser::checkLiveness (std::chrono::steady_clock::time_point now)
+{
+    for (auto it = mServices.begin(); it != mServices.end();)
+    {
+        WindnsDiscoveredService& service = it->second;
+
+        // A service that is gone does not answer, and DnsServiceResolve then never calls back.
+        if (service.resolveInFlight && now - service.resolveStartedAt >= kLivenessInterval)
+        {
+            DWORD res = DnsServiceResolveCancel (&service.resolveCancel);
+            if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
+                DNSSD_LOG_DEBUG ("- checkLiveness: DnsServiceResolveCancel failed for " << it->first << ": "
+                                 << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
+
+            service.resolveInFlight = false;
+            ++service.consecutiveResolveFailures;
+            DNSSD_LOG_DEBUG ("- checkLiveness: resolve timed out for " << it->first << " ("
+                             << service.consecutiveResolveFailures << " in a row)" << std::endl)
+        }
+
+        const bool tooManyFailures = service.consecutiveResolveFailures >= kMaxResolveFailures;
+        const bool ttlExpired = service.ttl > 0 && now - service.lastSeen > std::chrono::seconds (service.ttl);
+
+        if (tooManyFailures || ttlExpired)
+        {
+            DNSSD_LOG_DEBUG ("- checkLiveness: pruning " << it->first << ": "
+                             << (tooManyFailures ? "too many resolve failures" : "not seen within PTR TTL") << std::endl)
+            it = removeService (it);
+            continue;
+        }
+
+        if (!service.resolveInFlight)
+            issueResolve (it->first);
+
+        ++it;
+    }
+}
+
+void WindnsBrowser::pollTxtRecords()
+{
+    for (auto& entry : mServices)
+    {
+        if (!entry.second.resolveInFlight)
+            issueResolve (entry.first);
+    }
+}
+
+std::map<std::string, WindnsDiscoveredService>::iterator WindnsBrowser::removeService (
+    std::map<std::string, WindnsDiscoveredService>::iterator it)
+{
+    WindnsDiscoveredService& service = it->second;
+
+    // Cancelled requests still call back; those callbacks find the service gone and only clean up.
+    if (service.resolveInFlight)
+        DnsServiceResolveCancel (&service.resolveCancel);
+    if (service.aQueryInFlight && service.aCancel != nullptr)
+        DnsCancelQuery (service.aCancel);
+    if (service.aaaaQueryInFlight && service.aaaaCancel != nullptr)
+        DnsCancelQuery (service.aaaaCancel);
+
+    DNSSD_LOG_DEBUG ("- removeService: removed " << service.description.fullname << std::endl)
+
+    if (onServiceRemovedCallback)
+        onServiceRemovedCallback (service.description);
+
+    return mServices.erase (it);
+}
+
+void WindnsBrowser::callbackExpected()
+{
+    std::lock_guard<std::mutex> lk (mCancelMutex);
+    ++mOutstandingCallbacks;
+}
+
+void WindnsBrowser::callbackFinished()
+{
+    std::lock_guard<std::mutex> lk (mCancelMutex);
+    --mOutstandingCallbacks;
+    mCancelCv.notify_all();
+}
+
 WindnsBrowser::~WindnsBrowser()
 {
-    mStopPollThread = true;
+    {
+        std::lock_guard<std::mutex> lk (mPollMutex);
+        mStopPollThread.store (true, std::memory_order_release);
+    }
     mPollCv.notify_one();
     if (mPollThread.joinable())
         mPollThread.join();
 
     {
         std::lock_guard<std::recursive_mutex> lg (mLock);
+        mShuttingDown = true;
 
-        // Cancel resolve and address queries first — these have no guaranteed final callback.
+        // Cancel resolve and address queries. Cancelled requests still call back (ERROR_CANCELLED);
+        // mOutstandingCallbacks counts them, and we wait for them below.
         for (auto& entry : mServices)
         {
             WindnsDiscoveredService& service = entry.second;
-            if (service.resolveStarted && !service.resolveFinished)
+            if (service.resolveInFlight)
             {
                 DWORD res = DnsServiceResolveCancel (&service.resolveCancel);
                 if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
                     DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsServiceResolveCancel failed: "
                                      << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
             }
-            if (service.aQueryInFlight)
+            if (service.aQueryInFlight && service.aCancel != nullptr)
             {
-                DWORD res = DnsCancelQuery (&service.aCancel);
+                DWORD res = DnsCancelQuery (service.aCancel);
                 if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
                     DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsCancelQuery (A) failed: "
                                      << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
             }
-            if (service.aaaaQueryInFlight)
+            if (service.aaaaQueryInFlight && service.aaaaCancel != nullptr)
             {
-                DWORD res = DnsCancelQuery (&service.aaaaCancel);
+                DWORD res = DnsCancelQuery (service.aaaaCancel);
                 if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
                     DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsCancelQuery (AAAA) failed: "
                                      << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
@@ -134,9 +235,12 @@ WindnsBrowser::~WindnsBrowser()
         }
         mServices.clear();
 
-        // Cancel browses last — DnsServiceBrowseCancel guarantees one final browseCallback
-        // with ERROR_CANCELLED, which we use as a synchronisation point below.
-        mPendingBrowseCancels = static_cast<int> (mBrowseCancels.size());
+        // DnsServiceBrowseCancel results in one final browseCallback with ERROR_CANCELLED per browse,
+        // which we also wait for below.
+        {
+            std::lock_guard<std::mutex> lk (mCancelMutex);
+            mPendingBrowseCancels = static_cast<int> (mBrowseCancels.size());
+        }
         for (auto& entry : mBrowseCancels)
         {
             DWORD res = DnsServiceBrowseCancel (&entry.second);
@@ -148,9 +252,13 @@ WindnsBrowser::~WindnsBrowser()
     }
 
     std::unique_lock<std::mutex> lk (mCancelMutex);
-    bool completed = mCancelCv.wait_for (lk, kWindnsCallbackTimeout, [this]() { return mPendingBrowseCancels == 0; });
+    bool completed = mCancelCv.wait_for (lk, kWindnsCallbackTimeout, [this]() {
+        return mPendingBrowseCancels == 0 && mOutstandingCallbacks == 0;
+    });
     if (!completed)
-        DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: timed out waiting for browse cancellation callbacks" << std::endl)
+        DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: timed out waiting for callbacks (browse cancels: "
+                         << mPendingBrowseCancels << ", resolve/address queries: " << mOutstandingCallbacks << ")"
+                         << std::endl)
 }
 
 Result WindnsBrowser::browseFor (const std::string& serviceType)
@@ -206,14 +314,19 @@ VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PD
     if (static_cast<DNS_STATUS> (Status) == ERROR_CANCELLED)
     {
         std::lock_guard<std::mutex> lk (self->mCancelMutex);
-        if (--self->mPendingBrowseCancels == 0)
-            self->mCancelCv.notify_one();
+        --self->mPendingBrowseCancels;
+        self->mCancelCv.notify_all();
         return;
     }
 
     std::lock_guard<std::recursive_mutex> lg (self->mLock);
 
+    if (self->mShuttingDown)
+        return;
+
     DNSSD_LOG_DEBUG ("> browseCallback enter" << std::endl)
+
+    const auto now = std::chrono::steady_clock::now();
 
     if (self->reportIfError (Result (static_cast<DNS_STATUS> (Status))))
         return;
@@ -243,21 +356,8 @@ VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PD
             if (it == self->mServices.end())
                 continue;
 
-            WindnsDiscoveredService& service = it->second;
-
-            if (service.resolveStarted && !service.resolveFinished)
-                DnsServiceResolveCancel (&service.resolveCancel);
-            if (service.aQueryInFlight)
-                DnsCancelQuery (&service.aCancel);
-            if (service.aaaaQueryInFlight)
-                DnsCancelQuery (&service.aaaaCancel);
-
-            DNSSD_LOG_DEBUG ("- browseCallback: removed " << service.description.fullname << std::endl)
-
-            if (self->onServiceRemovedCallback)
-                self->onServiceRemovedCallback (service.description);
-
-            self->mServices.erase (it);
+            DNSSD_LOG_DEBUG ("- browseCallback: goodbye for " << instanceName << std::endl)
+            self->removeService (it);
         }
         else
         {
@@ -275,6 +375,7 @@ VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PD
 
                 WindnsDiscoveredService service;
                 service.ttl = record->dwTtl;
+                service.lastSeen = now;
                 service.description.fullname = instanceName;
                 service.description.name = name;
                 service.description.type = type;
@@ -294,12 +395,10 @@ VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PD
                 // Subsequent sighting — re-resolve to pick up TXT record updates.
                 // Skip if a resolve is already in flight.
                 it->second.ttl = record->dwTtl;
+                it->second.lastSeen = now;
 
-                if (it->second.resolveFinished)
-                {
-                    it->second.resolveFinished = false;
+                if (!it->second.resolveInFlight)
                     self->issueResolve (instanceName);
-                }
             }
         }
     }
@@ -311,34 +410,51 @@ VOID WINAPI WindnsBrowser::resolveCallback (DWORD Status, PVOID pQueryContext, P
 {
     auto* ctx = static_cast<ResolveContext*> (pQueryContext);
     auto* self = ctx->owner;
-    std::string instanceName = ctx->instanceName;
+    const std::string instanceName = ctx->instanceName;
+    const uint64_t resolveId = ctx->resolveId;
     delete ctx;
 
-    std::lock_guard<std::recursive_mutex> lg (self->mLock);
+    self->handleResolveCallback (instanceName, resolveId, Status, pInstance);
+    self->callbackFinished(); // last access to self
+}
+
+void WindnsBrowser::handleResolveCallback (
+    const std::string& instanceName,
+    uint64_t resolveId,
+    DWORD status,
+    PDNS_SERVICE_INSTANCE pInstance)
+{
+    std::lock_guard<std::recursive_mutex> lg (mLock);
 
     DNSSD_LOG_DEBUG ("> resolveCallback enter: " << instanceName << std::endl)
 
-    auto it = self->mServices.find (instanceName);
-    if (it == self->mServices.end())
+    auto it = mServices.find (instanceName);
+    if (it == mServices.end() || it->second.currentResolveId != resolveId)
     {
-        DNSSD_LOG_DEBUG ("- resolveCallback: service already removed, discarding result" << std::endl)
+        DNSSD_LOG_DEBUG ("- resolveCallback: service removed or resolve superseded, discarding result" << std::endl)
         if (pInstance != nullptr)
             DnsServiceFreeInstance (pInstance);
         return;
     }
 
-    it->second.resolveFinished = true;
+    WindnsDiscoveredService& service = it->second;
+    service.resolveInFlight = false;
 
-    if (static_cast<DNS_STATUS> (Status) == ERROR_CANCELLED)
+    // Cancelled by checkLiveness (already counted as a failure there) or by removeService.
+    if (static_cast<DNS_STATUS> (status) == ERROR_CANCELLED)
     {
         if (pInstance != nullptr)
             DnsServiceFreeInstance (pInstance);
         return;
     }
 
-    if (self->reportIfError (Result (static_cast<DNS_STATUS> (Status))))
+    if (status != ERROR_SUCCESS)
     {
-        DNSSD_LOG_DEBUG ("- resolveCallback: resolve failed for " << instanceName << std::endl)
+        ++service.consecutiveResolveFailures;
+        DNSSD_LOG_DEBUG ("- resolveCallback: resolve failed for " << instanceName << " ("
+                         << service.consecutiveResolveFailures << " in a row)" << std::endl)
+        reportIfError (Result ("Resolving " + instanceName + " failed: "
+                               + Result (static_cast<DNS_STATUS> (status)).description()));
         if (pInstance != nullptr)
             DnsServiceFreeInstance (pInstance);
         return;
@@ -346,11 +462,14 @@ VOID WINAPI WindnsBrowser::resolveCallback (DWORD Status, PVOID pQueryContext, P
 
     if (pInstance == nullptr)
     {
-        DNSSD_LOG_DEBUG ("- resolveCallback: pInstance is null"  << std::endl)
+        DNSSD_LOG_DEBUG ("- resolveCallback: pInstance is null" << std::endl)
         return;
     }
 
-    self->onResolveResult (instanceName, pInstance);
+    service.consecutiveResolveFailures = 0;
+    service.lastSeen = std::chrono::steady_clock::now();
+
+    onResolveResult (instanceName, pInstance);
     DnsServiceFreeInstance (pInstance);
 
     DNSSD_LOG_DEBUG ("< resolveCallback exit: " << instanceName << std::endl)
@@ -360,76 +479,68 @@ VOID WINAPI WindnsBrowser::aQueryCallback (PVOID pQueryContext, PDNS_QUERY_RESUL
 {
     auto* ctx = static_cast<AddressQueryContext*> (pQueryContext);
     auto* self = ctx->owner;
-    const std::string instanceName = ctx->instanceName;
 
-    std::lock_guard<std::recursive_mutex> lg (self->mLock);
-
-    DNSSD_LOG_DEBUG ("> aQueryCallback enter: " << instanceName << std::endl)
-
-    auto it = self->mServices.find (instanceName);
-    if (it != self->mServices.end())
-        it->second.aQueryInFlight = false;
-
-    if (pQueryResults == nullptr || pQueryResults->QueryStatus != ERROR_SUCCESS)
-    {
-        if (pQueryResults != nullptr && it != self->mServices.end()
-            && static_cast<DNS_STATUS> (pQueryResults->QueryStatus) != ERROR_CANCELLED)
-            self->reportIfError (Result (static_cast<DNS_STATUS> (pQueryResults->QueryStatus)));
-        delete ctx;
-        return;
-    }
-
-    if (it == self->mServices.end())
-    {
-        DNSSD_LOG_DEBUG ("- aQueryCallback: service already removed, discarding" << std::endl)
-        DnsRecordListFree (pQueryResults->pQueryRecords, DnsFreeRecordList);
-        delete ctx;
-        return;
-    }
-
-    self->onAddressResult (instanceName, pQueryResults->pQueryRecords);
-    DnsRecordListFree (pQueryResults->pQueryRecords, DnsFreeRecordList);
-
-    DNSSD_LOG_DEBUG ("< aQueryCallback exit: " << instanceName << std::endl)
-    delete ctx;
+    self->handleAddressQueryCallback (ctx->instanceName, pQueryResults, false);
+    delete ctx; // pQueryResults points into ctx
+    self->callbackFinished(); // last access to self
 }
 
 VOID WINAPI WindnsBrowser::aaaaQueryCallback (PVOID pQueryContext, PDNS_QUERY_RESULT pQueryResults)
 {
     auto* ctx = static_cast<AddressQueryContext*> (pQueryContext);
     auto* self = ctx->owner;
-    const std::string instanceName = ctx->instanceName;
 
-    std::lock_guard<std::recursive_mutex> lg (self->mLock);
+    self->handleAddressQueryCallback (ctx->instanceName, pQueryResults, true);
+    delete ctx; // pQueryResults points into ctx
+    self->callbackFinished(); // last access to self
+}
 
-    DNSSD_LOG_DEBUG ("> aaaaQueryCallback enter: " << instanceName << std::endl)
+void WindnsBrowser::handleAddressQueryCallback (const std::string& instanceName, PDNS_QUERY_RESULT pQueryResults, bool isIpv6)
+{
+    std::lock_guard<std::recursive_mutex> lg (mLock);
 
-    auto it = self->mServices.find (instanceName);
-    if (it != self->mServices.end())
-        it->second.aaaaQueryInFlight = false;
+    const char* queryType = isIpv6 ? "AAAA" : "A";
+    DNSSD_LOG_DEBUG ("> addressQueryCallback (" << queryType << ") enter: " << instanceName << std::endl)
 
-    if (pQueryResults == nullptr || pQueryResults->QueryStatus != ERROR_SUCCESS)
+    auto it = mServices.find (instanceName);
+    if (it != mServices.end())
     {
-        if (pQueryResults != nullptr && it != self->mServices.end()
-            && static_cast<DNS_STATUS> (pQueryResults->QueryStatus) != ERROR_CANCELLED)
-            self->reportIfError (Result (static_cast<DNS_STATUS> (pQueryResults->QueryStatus)));
-        delete ctx;
+        if (isIpv6)
+        {
+            it->second.aaaaQueryInFlight = false;
+            it->second.aaaaCancel = nullptr;
+        }
+        else
+        {
+            it->second.aQueryInFlight = false;
+            it->second.aCancel = nullptr;
+        }
+    }
+
+    if (pQueryResults == nullptr)
+        return;
+
+    if (pQueryResults->QueryStatus != ERROR_SUCCESS)
+    {
+        if (it != mServices.end() && static_cast<DNS_STATUS> (pQueryResults->QueryStatus) != ERROR_CANCELLED)
+            reportIfError (Result (std::string (queryType) + " query for " + instanceName + " failed: "
+                                   + Result (static_cast<DNS_STATUS> (pQueryResults->QueryStatus)).description()));
+        if (pQueryResults->pQueryRecords != nullptr)
+            DnsRecordListFree (pQueryResults->pQueryRecords, DnsFreeRecordList);
         return;
     }
 
-    if (it == self->mServices.end())
+    if (it == mServices.end())
     {
-        DNSSD_LOG_DEBUG ("- aaaaQueryCallback: service already removed, discarding" << std::endl)
+        DNSSD_LOG_DEBUG ("- addressQueryCallback: service already removed, discarding" << std::endl)
         DnsRecordListFree (pQueryResults->pQueryRecords, DnsFreeRecordList);
-        delete ctx;
         return;
     }
 
-    self->onAddressResult (instanceName, pQueryResults->pQueryRecords);
+    onAddressResult (instanceName, pQueryResults->pQueryRecords);
     DnsRecordListFree (pQueryResults->pQueryRecords, DnsFreeRecordList);
 
-    DNSSD_LOG_DEBUG ("< aaaaQueryCallback exit: " << instanceName << std::endl)
-    delete ctx;
+    DNSSD_LOG_DEBUG ("< addressQueryCallback (" << queryType << ") exit: " << instanceName << std::endl)
 }
 
 void WindnsBrowser::issueResolve (const std::string& instanceName)
@@ -443,7 +554,9 @@ void WindnsBrowser::issueResolve (const std::string& instanceName)
     if (reportIfError (r))
         return;
 
-    auto* ctx = new ResolveContext { this, instanceName };
+    WindnsDiscoveredService& service = it->second;
+    const uint64_t resolveId = ++mNextResolveId;
+    auto* ctx = new ResolveContext { this, instanceName, resolveId };
 
     DNS_SERVICE_RESOLVE_REQUEST req {};
     req.Version = DNS_QUERY_REQUEST_VERSION1;
@@ -452,16 +565,24 @@ void WindnsBrowser::issueResolve (const std::string& instanceName)
     req.pResolveCompletionCallback = &WindnsBrowser::resolveCallback;
     req.pQueryContext = ctx;
 
-    DWORD status = DnsServiceResolve (&req, &it->second.resolveCancel);
+    // Set before the call: if the callback runs synchronously on this thread (mLock is recursive), it must see this
+    // resolve as current and in flight.
+    service.currentResolveId = resolveId;
+    service.resolveStartedAt = std::chrono::steady_clock::now();
+    service.resolveInFlight = true;
+    callbackExpected();
+
+    DWORD status = DnsServiceResolve (&req, &service.resolveCancel);
 
     if (status != DNS_REQUEST_PENDING && status != ERROR_SUCCESS)
     {
         delete ctx;
-        reportIfError (Result (static_cast<DNS_STATUS> (status)));
-        return;
+        callbackFinished();
+        service.resolveInFlight = false;
+        ++service.consecutiveResolveFailures;
+        reportIfError (Result ("Resolving " + instanceName + " failed: "
+                               + Result (static_cast<DNS_STATUS> (status)).description()));
     }
-
-    it->second.resolveStarted = true;
 }
 
 void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const std::string& hostName)
@@ -497,22 +618,31 @@ void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const 
         req.pQueryCompletionCallback = &WindnsBrowser::aQueryCallback;
         req.pQueryContext = ctx;
 
-        DWORD status = DnsQueryEx (&req, &ctx->queryResult, &service.aCancel);
+        // Set before the call, in case the callback runs synchronously on this thread.
+        service.aQueryInFlight = true;
+        service.aCancel = &ctx->cancel;
+        callbackExpected();
 
-        if (status == ERROR_SUCCESS)
+        DWORD status = DnsQueryEx (&req, &ctx->queryResult, &ctx->cancel);
+
+        if (status != DNS_REQUEST_PENDING)
         {
-            onAddressResult (instanceName, ctx->queryResult.pQueryRecords);
-            DnsRecordListFree (ctx->queryResult.pQueryRecords, DnsFreeRecordList);
+            // Completed synchronously or failed: no callback will come.
+            service.aQueryInFlight = false;
+            service.aCancel = nullptr;
+            callbackFinished();
+
+            if (status == ERROR_SUCCESS)
+            {
+                onAddressResult (instanceName, ctx->queryResult.pQueryRecords);
+                DnsRecordListFree (ctx->queryResult.pQueryRecords, DnsFreeRecordList);
+            }
+            else
+            {
+                reportIfError (Result ("A query for " + instanceName + " failed: "
+                                       + Result (static_cast<DNS_STATUS> (status)).description()));
+            }
             delete ctx;
-        }
-        else if (status == DNS_REQUEST_PENDING)
-        {
-            service.aQueryInFlight = true;
-        }
-        else
-        {
-            delete ctx;
-            reportIfError (Result (static_cast<DNS_STATUS> (status)));
         }
     }
 
@@ -531,22 +661,31 @@ void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const 
         req.pQueryCompletionCallback = &WindnsBrowser::aaaaQueryCallback;
         req.pQueryContext = ctx;
 
-        DWORD status = DnsQueryEx (&req, &ctx->queryResult, &service.aaaaCancel);
+        // Set before the call, in case the callback runs synchronously on this thread.
+        service.aaaaQueryInFlight = true;
+        service.aaaaCancel = &ctx->cancel;
+        callbackExpected();
 
-        if (status == ERROR_SUCCESS)
+        DWORD status = DnsQueryEx (&req, &ctx->queryResult, &ctx->cancel);
+
+        if (status != DNS_REQUEST_PENDING)
         {
-            onAddressResult (instanceName, ctx->queryResult.pQueryRecords);
-            DnsRecordListFree (ctx->queryResult.pQueryRecords, DnsFreeRecordList);
+            // Completed synchronously or failed: no callback will come.
+            service.aaaaQueryInFlight = false;
+            service.aaaaCancel = nullptr;
+            callbackFinished();
+
+            if (status == ERROR_SUCCESS)
+            {
+                onAddressResult (instanceName, ctx->queryResult.pQueryRecords);
+                DnsRecordListFree (ctx->queryResult.pQueryRecords, DnsFreeRecordList);
+            }
+            else
+            {
+                reportIfError (Result ("AAAA query for " + instanceName + " failed: "
+                                       + Result (static_cast<DNS_STATUS> (status)).description()));
+            }
             delete ctx;
-        }
-        else if (status == DNS_REQUEST_PENDING)
-        {
-            service.aaaaQueryInFlight = true;
-        }
-        else
-        {
-            delete ctx;
-            reportIfError (Result (static_cast<DNS_STATUS> (status)));
         }
     }
 }

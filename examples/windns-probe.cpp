@@ -37,7 +37,8 @@ long long elapsedMs (Clock::time_point since = gStart)
 void logLine (const std::string& line)
 {
     std::lock_guard<std::mutex> lg (gLogMutex);
-    std::cout << "[" << std::setw (8) << elapsedMs() << " ms] " << line << std::endl;
+    std::cout << "[" << std::setw (8) << elapsedMs() << " ms tid " << std::setw (5) << GetCurrentThreadId() << "] "
+              << line << std::endl;
 }
 
 void waitForEnter (const std::string& prompt)
@@ -410,9 +411,10 @@ void runResolve (const std::wstring& instanceName, std::chrono::milliseconds tim
     r->abandoned = true;
     lock.unlock();
 
+    logLine ("  NO callback within timeout; calling DnsServiceResolveCancel");
+    DWORD cancelStatus = DnsServiceResolveCancel (&r->cancel);
     std::stringstream s;
-    s << "  NO callback within " << timeout.count() << " ms; DnsServiceResolveCancel returned "
-      << statusText (DnsServiceResolveCancel (&r->cancel));
+    s << "  DnsServiceResolveCancel returned " << statusText (cancelStatus) << " (timeout was " << timeout.count() << " ms)";
     logLine (s.str());
 }
 
