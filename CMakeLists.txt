@@ -88,10 +88,4 @@ if (NOT DNSSD_NO_EXAMPLES)
 
     add_executable(dnssd-browser examples/dnssd-browser.cpp)
     target_link_libraries(dnssd-browser dnssd-cpp)
-
-    # Temporary WinDNS behaviour probe for the stale-service investigation; remove when done.
-    if (WIN32 AND USE_WINDNS)
-        add_executable(windns-probe examples/windns-probe.cpp)
-        target_link_libraries(windns-probe dnssd-cpp ws2_32 dnsapi)
-    endif ()
 endif ()
