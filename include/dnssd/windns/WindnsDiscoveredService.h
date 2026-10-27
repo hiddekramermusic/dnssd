@@ -8,10 +8,36 @@
 #include "dnssd/ServiceDescription.h"
 
 #include <chrono>
-#include <cstdint>
+#include <memory>
+#include <string>
 
 namespace dnssd
 {
+
+class WindnsBrowser;
+
+/**
+ * One DnsServiceResolve call: the request state and its cancel handle.
+ */
+struct WindnsResolveRequest
+{
+    WindnsBrowser* owner = nullptr;
+    std::string instanceName;
+    DNS_SERVICE_CANCEL cancel {};
+};
+
+/**
+ * One DnsQueryEx A or AAAA call: the request state, its result and its cancel handle.
+ */
+struct WindnsAddressQuery
+{
+    WindnsBrowser* owner = nullptr;
+    std::string instanceName;
+    bool isIpv6 = false;
+    /// Result struct kept alive until the async callback fires (pQueryResults == &result).
+    DNS_QUERY_RESULT result {};
+    DNS_QUERY_CANCEL cancel {};
+};
 
 /**
  * Tracks all resolved state for a single discovered service instance.
@@ -34,28 +60,14 @@ struct WindnsDiscoveredService
     /// Resolves in a row that failed or timed out. Reset only by a successful resolve.
     int consecutiveResolveFailures = 0;
 
-    /// Id of the current DnsServiceResolve call. Callbacks carrying another id (e.g. the ERROR_CANCELLED callback of a
-    /// resolve that timed out) do not change this service's state.
-    uint64_t currentResolveId = 0;
+    /// The in-flight DnsServiceResolve call, or nullptr.
+    std::shared_ptr<WindnsResolveRequest> resolve;
 
-    /// Cancel handle for the in-flight DnsServiceResolve call.
-    DNS_SERVICE_CANCEL resolveCancel {};
+    /// The in-flight A record (IPv4) query, or nullptr.
+    std::shared_ptr<WindnsAddressQuery> aQuery;
 
-    /// Cancel handle of the in-flight A record (IPv4) query. Points into the query's heap-allocated context, which
-    /// lives until the query callback, as DnsCancelQuery requires. Valid only while aQueryInFlight.
-    DNS_QUERY_CANCEL* aCancel = nullptr;
-
-    /// Cancel handle of the in-flight AAAA record (IPv6) query. Same lifetime rules as aCancel.
-    DNS_QUERY_CANCEL* aaaaCancel = nullptr;
-
-    /// True while a DnsServiceResolve call is in-flight (cancel handle is live).
-    bool resolveInFlight = false;
-
-    /// True while a DnsQueryEx A (IPv4) call is in-flight (cancel handle is live).
-    bool aQueryInFlight = false;
-
-    /// True while a DnsQueryEx AAAA (IPv6) call is in-flight (cancel handle is live).
-    bool aaaaQueryInFlight = false;
+    /// The in-flight AAAA record (IPv6) query, or nullptr.
+    std::shared_ptr<WindnsAddressQuery> aaaaQuery;
 };
 
 } // namespace dnssd

@@ -69,9 +69,7 @@ private:
     bool isRegistrationPending();
 
     /**
-    * Cancels a pending registration with DnsServiceRegisterCancel. Returns without waiting if the cancel succeeds.
-    * If the cancel fails, the registration may already be completing, so it waits (up to kWindnsCallbackTimeout)
-    * for the register callback.
+    * Cancels a pending registration. If the cancel fails, waits up to kWindnsCallbackTimeout for the register callback.
     */
     void cancelPendingRegistration() noexcept;
 };

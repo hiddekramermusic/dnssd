@@ -12,6 +12,7 @@
 #include <dnssd/windns/Windns.h>
 #include <dnssd/windns/WindnsUtil.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <iomanip>
@@ -418,6 +419,68 @@ void runResolve (const std::wstring& instanceName, std::chrono::milliseconds tim
     logLine (s.str());
 }
 
+// MARK: - Callbacks per DnsServiceResolve
+
+struct ResolveCountState
+{
+    int round = 0;
+    std::atomic<int> callbacks { 0 };
+    Clock::time_point started;
+};
+
+VOID WINAPI resolveCountCallback (DWORD status, PVOID context, PDNS_SERVICE_INSTANCE instance)
+{
+    auto* st = static_cast<ResolveCountState*> (context);
+    const int n = ++st->callbacks;
+
+    std::stringstream s;
+    s << "  round " << st->round << " callback #" << n << " after " << elapsedMs (st->started)
+      << " ms, status=" << statusText (status) << " " << instanceText (instance);
+    logLine (s.str());
+
+    if (instance != nullptr)
+        DnsServiceFreeInstance (instance);
+}
+
+/**
+ * Issues one DnsServiceResolve per round and counts every callback it produces within waitMs.
+ * The state is never freed, so any number of callbacks per resolve is safe to observe.
+ */
+int cmdResolveCount (const std::string& instance, int rounds, int waitMs)
+{
+    const std::wstring name = wide (instance);
+
+    for (int i = 1; i <= rounds; ++i)
+    {
+        auto* st = new ResolveCountState; // intentionally leaked
+        st->round = i;
+
+        DNS_SERVICE_RESOLVE_REQUEST req {};
+        req.Version = DNS_QUERY_REQUEST_VERSION1;
+        req.InterfaceIndex = 0;
+        req.QueryName = const_cast<PWSTR> (name.c_str());
+        req.pResolveCompletionCallback = &resolveCountCallback;
+        req.pQueryContext = st;
+
+        static DNS_SERVICE_CANCEL cancels[64]; // static storage: each handle stays valid until the process exits
+        DNS_SERVICE_CANCEL& cancel = cancels[(i - 1) % 64];
+
+        std::stringstream s;
+        s << "===== round " << i << "/" << rounds << " =====";
+        logLine (s.str());
+
+        st->started = Clock::now();
+        logLine ("DnsServiceResolve returned " + statusText (DnsServiceResolve (&req, &cancel)));
+
+        std::this_thread::sleep_for (std::chrono::milliseconds (waitMs));
+
+        std::stringstream result;
+        result << "round " << i << ": " << st->callbacks.load() << " callback(s) within " << waitMs << " ms";
+        logLine (result.str());
+    }
+    return 0;
+}
+
 // MARK: - Register / cancel / deregister (raw API)
 
 struct RegisterState
@@ -640,6 +703,9 @@ void usage()
            "      Per round: DnsServiceResolve, then SRV query from cache, via mDNS, and via mDNS bypassing the cache.\n"
            "      intervalMs is also the timeout for each call.\n"
            "\n"
+           "  windns-probe resolve-count <instance> [rounds=3] [waitMs=10000]\n"
+           "      Issues one DnsServiceResolve per round and logs every callback it produces within waitMs.\n"
+           "\n"
            "  windns-probe query <name> <ptr|srv|txt|a|aaaa> <cache|mdns|bypass|standard> [timeoutMs=5000]\n"
            "\n"
            "  windns-probe reg-cancel <type> <port> <immediate|after>\n"
@@ -673,6 +739,10 @@ int main (int argc, char* argv[])
         if (cmd == "liveness" && args.size() >= 2)
             return cmdLiveness (
                 args[1], args.size() >= 3 ? std::stoi (args[2]) : 5, args.size() >= 4 ? std::stoi (args[3]) : 5000);
+
+        if (cmd == "resolve-count" && args.size() >= 2)
+            return cmdResolveCount (
+                args[1], args.size() >= 3 ? std::stoi (args[2]) : 3, args.size() >= 4 ? std::stoi (args[3]) : 10000);
 
         if (cmd == "query" && args.size() >= 4)
         {
