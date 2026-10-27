@@ -49,6 +49,25 @@ bool parseInstanceName (
     return true;
 }
 
+/**
+ * Returns the key under which a service instance is stored: the instance name in ASCII lowercase, without trailing
+ * dots. DNS names compare case-insensitively, and a trailing dot only marks a name as fully qualified.
+ *
+ * @param instanceName  Instance name as received from DnsServiceBrowse (e.g. "My Device._http._tcp.local").
+ */
+std::string makeServiceKey (const std::string& instanceName)
+{
+    std::string key = instanceName;
+    while (!key.empty() && key.back() == '.')
+        key.pop_back();
+    for (char& c : key)
+    {
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char> (c - 'A' + 'a');
+    }
+    return key;
+}
+
 } // namespace
 
 namespace dnssd
@@ -194,7 +213,7 @@ void WindnsBrowser::runCancels (PendingCancels& pending)
     {
         DWORD res = DnsServiceResolveCancel (&request->cancel);
         if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-            DNSSD_LOG_DEBUG ("- runCancels: DnsServiceResolveCancel failed for " << request->instanceName << ": "
+            DNSSD_LOG_DEBUG ("- runCancels: DnsServiceResolveCancel failed for " << request->serviceKey << ": "
                              << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
     }
 
@@ -203,7 +222,7 @@ void WindnsBrowser::runCancels (PendingCancels& pending)
         DWORD res = DnsCancelQuery (&query->cancel);
         if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
             DNSSD_LOG_DEBUG ("- runCancels: DnsCancelQuery (" << (query->isIpv6 ? "AAAA" : "A") << ") failed for "
-                             << query->instanceName << ": "
+                             << query->serviceKey << ": "
                              << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
     }
 
@@ -379,19 +398,24 @@ void WindnsBrowser::handleBrowseResults (DWORD status, PDNS_RECORD pDnsRecord, P
             continue;
         }
 
+        const std::string serviceKey = makeServiceKey (instanceName);
+
         if (record->dwTtl == 0)
         {
             // Goodbye packet — the service is being removed
-            auto it = mServices.find (instanceName);
+            auto it = mServices.find (serviceKey);
             if (it == mServices.end())
+            {
+                DNSSD_LOG_DEBUG ("- browseCallback: goodbye for unknown instance " << instanceName << ", ignored" << std::endl)
                 continue;
+            }
 
             DNSSD_LOG_DEBUG ("- browseCallback: goodbye for " << instanceName << std::endl)
             removeService (it, pending);
         }
         else
         {
-            auto it = mServices.find (instanceName);
+            auto it = mServices.find (serviceKey);
 
             if (it == mServices.end())
             {
@@ -411,14 +435,14 @@ void WindnsBrowser::handleBrowseResults (DWORD status, PDNS_RECORD pDnsRecord, P
                 service.description.type = type;
                 service.description.domain = domain;
 
-                it = mServices.emplace (instanceName, std::move (service)).first;
+                it = mServices.emplace (serviceKey, std::move (service)).first;
 
                 DNSSD_LOG_DEBUG ("- browseCallback: discovered " << instanceName << std::endl)
 
                 if (onServiceDiscoveredCallback)
                     onServiceDiscoveredCallback (it->second.description);
 
-                issueResolve (instanceName);
+                issueResolve (serviceKey);
             }
             else
             {
@@ -428,7 +452,7 @@ void WindnsBrowser::handleBrowseResults (DWORD status, PDNS_RECORD pDnsRecord, P
                 it->second.lastSeen = now;
 
                 if (it->second.resolve == nullptr)
-                    issueResolve (instanceName);
+                    issueResolve (serviceKey);
             }
         }
     }
@@ -458,10 +482,10 @@ void WindnsBrowser::handleResolveCallback (
 {
     std::lock_guard<std::recursive_mutex> lg (mLock);
 
-    const std::string& instanceName = request->instanceName;
-    DNSSD_LOG_DEBUG ("> resolveCallback enter: " << instanceName << std::endl)
+    const std::string& serviceKey = request->serviceKey;
+    DNSSD_LOG_DEBUG ("> resolveCallback enter: " << serviceKey << std::endl)
 
-    auto it = mServices.find (instanceName);
+    auto it = mServices.find (serviceKey);
     if (it == mServices.end() || it->second.resolve != request)
     {
         DNSSD_LOG_DEBUG ("- resolveCallback: service removed or resolve superseded, discarding result" << std::endl)
@@ -484,9 +508,9 @@ void WindnsBrowser::handleResolveCallback (
     if (status != ERROR_SUCCESS)
     {
         ++service.consecutiveResolveFailures;
-        DNSSD_LOG_DEBUG ("- resolveCallback: resolve failed for " << instanceName << " ("
+        DNSSD_LOG_DEBUG ("- resolveCallback: resolve failed for " << serviceKey << " ("
                          << service.consecutiveResolveFailures << " in a row)" << std::endl)
-        reportIfError (Result ("Resolving " + instanceName + " failed: "
+        reportIfError (Result ("Resolving " + service.description.fullname + " failed: "
                                + Result (static_cast<DNS_STATUS> (status)).description()));
         if (pInstance != nullptr)
             DnsServiceFreeInstance (pInstance);
@@ -502,10 +526,10 @@ void WindnsBrowser::handleResolveCallback (
     service.consecutiveResolveFailures = 0;
     service.lastSeen = std::chrono::steady_clock::now();
 
-    onResolveResult (instanceName, pInstance);
+    onResolveResult (serviceKey, pInstance);
     DnsServiceFreeInstance (pInstance);
 
-    DNSSD_LOG_DEBUG ("< resolveCallback exit: " << instanceName << std::endl)
+    DNSSD_LOG_DEBUG ("< resolveCallback exit: " << serviceKey << std::endl)
 }
 
 VOID WINAPI WindnsBrowser::addressQueryCallback (PVOID pQueryContext, PDNS_QUERY_RESULT pQueryResults)
@@ -527,13 +551,13 @@ void WindnsBrowser::handleAddressQueryCallback (const std::shared_ptr<WindnsAddr
 {
     std::lock_guard<std::recursive_mutex> lg (mLock);
 
-    const std::string& instanceName = query->instanceName;
+    const std::string& serviceKey = query->serviceKey;
     const char* queryType = query->isIpv6 ? "AAAA" : "A";
-    DNSSD_LOG_DEBUG ("> addressQueryCallback (" << queryType << ") enter: " << instanceName << std::endl)
+    DNSSD_LOG_DEBUG ("> addressQueryCallback (" << queryType << ") enter: " << serviceKey << std::endl)
 
     // Current only if the service still exists and this is its in-flight query (not cancelled by removeService).
     bool current = false;
-    auto it = mServices.find (instanceName);
+    auto it = mServices.find (serviceKey);
     if (it != mServices.end())
     {
         std::shared_ptr<WindnsAddressQuery>& slot = query->isIpv6 ? it->second.aaaaQuery : it->second.aQuery;
@@ -550,7 +574,7 @@ void WindnsBrowser::handleAddressQueryCallback (const std::shared_ptr<WindnsAddr
     if (pQueryResults->QueryStatus != ERROR_SUCCESS)
     {
         if (current && static_cast<DNS_STATUS> (pQueryResults->QueryStatus) != ERROR_CANCELLED)
-            reportIfError (Result (std::string (queryType) + " query for " + instanceName + " failed: "
+            reportIfError (Result (std::string (queryType) + " query for " + it->second.description.fullname + " failed: "
                                    + Result (static_cast<DNS_STATUS> (pQueryResults->QueryStatus)).description()));
         if (pQueryResults->pQueryRecords != nullptr)
             DnsRecordListFree (pQueryResults->pQueryRecords, DnsFreeRecordList);
@@ -564,28 +588,32 @@ void WindnsBrowser::handleAddressQueryCallback (const std::shared_ptr<WindnsAddr
         return;
     }
 
-    onAddressResult (instanceName, pQueryResults->pQueryRecords);
+    onAddressResult (serviceKey, pQueryResults->pQueryRecords);
     DnsRecordListFree (pQueryResults->pQueryRecords, DnsFreeRecordList);
 
-    DNSSD_LOG_DEBUG ("< addressQueryCallback (" << queryType << ") exit: " << instanceName << std::endl)
+    DNSSD_LOG_DEBUG ("< addressQueryCallback (" << queryType << ") exit: " << serviceKey << std::endl)
 }
 
-void WindnsBrowser::issueResolve (const std::string& instanceName)
+void WindnsBrowser::issueResolve (const std::string& serviceKey)
 {
-    auto it = mServices.find (instanceName);
+    auto it = mServices.find (serviceKey);
     if (it == mServices.end())
         return;
 
+    WindnsDiscoveredService& service = it->second;
+    const std::string& instanceName = service.description.fullname;
+
     std::wstring instanceNameW;
     auto r = toWideString (instanceName, instanceNameW);
-    if (reportIfError (r))
+    if (r.hasError())
+    {
+        reportIfError (Result ("Resolving " + instanceName + " failed: " + r.description()));
         return;
-
-    WindnsDiscoveredService& service = it->second;
+    }
 
     auto request = std::make_shared<WindnsResolveRequest>();
     request->owner = this;
-    request->instanceName = instanceName;
+    request->serviceKey = serviceKey;
     auto* holder = new std::shared_ptr<WindnsResolveRequest> (request); // callback context, deleted in the callback
 
     DNS_SERVICE_RESOLVE_REQUEST req {};
@@ -615,9 +643,9 @@ void WindnsBrowser::issueResolve (const std::string& instanceName)
     }
 }
 
-void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const std::string& hostName)
+void WindnsBrowser::issueAddressQueries (const std::string& serviceKey, const std::string& hostName)
 {
-    auto it = mServices.find (instanceName);
+    auto it = mServices.find (serviceKey);
     if (it == mServices.end())
         return;
 
@@ -625,21 +653,25 @@ void WindnsBrowser::issueAddressQueries (const std::string& instanceName, const 
 
     std::wstring hostNameW;
     auto r = toWideString (hostName, hostNameW);
-    if (reportIfError (r))
+    if (r.hasError())
+    {
+        reportIfError (Result ("Address query for " + service.description.fullname + " (host " + hostName + ") failed: "
+                               + r.description()));
         return;
+    }
 
     // .local hostnames must be resolved via multicast DNS; standard unicast DNS has no record of them.
     const DWORD queryOptions = (hostName.size() >= 6 && hostName.compare (hostName.size() - 6, 6, ".local") == 0)
                                    ? DNS_QUERY_MULTICAST_ONLY
                                    : DNS_QUERY_STANDARD;
 
-    issueAddressQuery (service, instanceName, hostNameW, queryOptions, false); // A record (IPv4)
-    issueAddressQuery (service, instanceName, hostNameW, queryOptions, true); // AAAA record (IPv6)
+    issueAddressQuery (service, serviceKey, hostNameW, queryOptions, false); // A record (IPv4)
+    issueAddressQuery (service, serviceKey, hostNameW, queryOptions, true); // AAAA record (IPv6)
 }
 
 void WindnsBrowser::issueAddressQuery (
     WindnsDiscoveredService& service,
-    const std::string& instanceName,
+    const std::string& serviceKey,
     const std::wstring& hostName,
     DWORD queryOptions,
     bool isIpv6)
@@ -650,7 +682,7 @@ void WindnsBrowser::issueAddressQuery (
 
     auto query = std::make_shared<WindnsAddressQuery>();
     query->owner = this;
-    query->instanceName = instanceName;
+    query->serviceKey = serviceKey;
     query->isIpv6 = isIpv6;
     query->result.Version = DNS_QUERY_REQUEST_VERSION1;
     auto* holder = new std::shared_ptr<WindnsAddressQuery> (query); // callback context, deleted in the callback
@@ -681,19 +713,19 @@ void WindnsBrowser::issueAddressQuery (
 
     if (status == ERROR_SUCCESS)
     {
-        onAddressResult (instanceName, query->result.pQueryRecords);
+        onAddressResult (serviceKey, query->result.pQueryRecords);
         DnsRecordListFree (query->result.pQueryRecords, DnsFreeRecordList);
     }
     else
     {
-        reportIfError (Result (std::string (isIpv6 ? "AAAA" : "A") + " query for " + instanceName + " failed: "
+        reportIfError (Result (std::string (isIpv6 ? "AAAA" : "A") + " query for " + service.description.fullname + " failed: "
                                + Result (static_cast<DNS_STATUS> (status)).description()));
     }
 }
 
-void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVICE_INSTANCE pInstance)
+void WindnsBrowser::onResolveResult (const std::string& serviceKey, PDNS_SERVICE_INSTANCE pInstance)
 {
-    auto it = mServices.find (instanceName);
+    auto it = mServices.find (serviceKey);
     if (it == mServices.end())
         return;
 
@@ -707,8 +739,11 @@ void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVI
     if (pInstance->pszHostName != nullptr)
     {
         auto r = toNarrowString (pInstance->pszHostName, desc.hostTarget);
-        if (reportIfError (r))
+        if (r.hasError())
+        {
+            reportIfError (Result ("Reading the host name of " + desc.fullname + " failed: " + r.description()));
             return;
+        }
     }
 
     desc.port = pInstance->wPort;
@@ -740,7 +775,7 @@ void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVI
         desc.txtRecord[key] = value;
     }
 
-    DNSSD_LOG_DEBUG ("- onResolveResult: " << instanceName << " host=" << desc.hostTarget << " port=" << desc.port << std::endl)
+    DNSSD_LOG_DEBUG ("- onResolveResult: " << serviceKey << " host=" << desc.hostTarget << " port=" << desc.port << std::endl)
 
     const bool changed = desc.hostTarget != previousHostTarget || desc.port != previousPort
                          || desc.txtRecord != previousTxtRecord;
@@ -766,7 +801,7 @@ void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVI
             std::string address = buf;
             if (desc.interfaces[ifIndex].insert (address).second)
             {
-                DNSSD_LOG_DEBUG ("- onResolveResult: added IPv4 " << address << " for " << instanceName << std::endl)
+                DNSSD_LOG_DEBUG ("- onResolveResult: added IPv4 " << address << " for " << serviceKey << std::endl)
                 if (onAddressAddedCallback)
                     onAddressAddedCallback (desc, address, ifIndex);
             }
@@ -782,7 +817,7 @@ void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVI
             std::string address = buf;
             if (desc.interfaces[ifIndex].insert (address).second)
             {
-                DNSSD_LOG_DEBUG ("- onResolveResult: added IPv6 " << address << " for " << instanceName << std::endl)
+                DNSSD_LOG_DEBUG ("- onResolveResult: added IPv6 " << address << " for " << serviceKey << std::endl)
                 if (onAddressAddedCallback)
                     onAddressAddedCallback (desc, address, ifIndex);
             }
@@ -791,12 +826,12 @@ void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVI
     }
 
     if (!hasAddresses && !desc.hostTarget.empty())
-        issueAddressQueries (instanceName, desc.hostTarget);
+        issueAddressQueries (serviceKey, desc.hostTarget);
 }
 
-void WindnsBrowser::onAddressResult (const std::string& instanceName, PDNS_RECORD records)
+void WindnsBrowser::onAddressResult (const std::string& serviceKey, PDNS_RECORD records)
 {
-    auto it = mServices.find (instanceName);
+    auto it = mServices.find (serviceKey);
     if (it == mServices.end())
         return;
 
@@ -836,7 +871,7 @@ void WindnsBrowser::onAddressResult (const std::string& instanceName, PDNS_RECOR
                 if (ifIt->second.empty())
                     desc.interfaces.erase (ifIt);
 
-                DNSSD_LOG_DEBUG ("- onAddressResult: removed " << address << " for " << instanceName << std::endl)
+                DNSSD_LOG_DEBUG ("- onAddressResult: removed " << address << " for " << serviceKey << std::endl)
 
                 if (onAddressRemovedCallback)
                     onAddressRemovedCallback (desc, address, ifIndex);
@@ -847,7 +882,7 @@ void WindnsBrowser::onAddressResult (const std::string& instanceName, PDNS_RECOR
             bool inserted = desc.interfaces[ifIndex].insert (address).second;
             if (inserted)
             {
-                DNSSD_LOG_DEBUG ("- onAddressResult: added " << address << " for " << instanceName << std::endl)
+                DNSSD_LOG_DEBUG ("- onAddressResult: added " << address << " for " << serviceKey << std::endl)
 
                 if (onAddressAddedCallback)
                     onAddressAddedCallback (desc, address, ifIndex);

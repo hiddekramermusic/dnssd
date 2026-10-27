@@ -91,7 +91,8 @@ private:
     /// One cancel handle per browsed service type, keyed by wide-string service type.
     std::map<std::wstring, DNS_SERVICE_CANCEL> mBrowseCancels;
 
-    /// All currently known service instances, keyed by fully-qualified instance name (narrow, as received from browse).
+    /// All currently known service instances, keyed by instance name in ASCII lowercase without trailing dots.
+    /// The name as received from browse is kept in ServiceDescription::fullname.
     std::map<std::string, WindnsDiscoveredService> mServices;
 
     /// Guards mServices and mShuttingDown.
@@ -177,11 +178,11 @@ private:
     void callbackFinished();
 
     /**
-     * Issues DnsServiceResolve for the given instance name and stores the request in the service's `resolve`.
+     * Issues DnsServiceResolve for the service and stores the request in the service's `resolve`.
      * Must be called with mLock held.
-     * @param instanceName Fully-qualified instance name (e.g. "MyDevice._http._tcp.local").
+     * @param serviceKey Key of the service in mServices.
      */
-    void issueResolve (const std::string& instanceName);
+    void issueResolve (const std::string& serviceKey);
 
     /**
      * Removes a service: adds its in-flight requests to `pending`, fires onServiceRemovedCallback and erases it.
@@ -208,10 +209,10 @@ private:
     /**
      * Issues DnsQueryEx for A and AAAA records for the given host name, unless that query is already in flight.
      * Must be called with mLock held.
-     * @param instanceName Instance name used to look up the service on callback.
-     * @param hostName     Host to query (e.g. "MyDevice.local").
+     * @param serviceKey Key of the service in mServices.
+     * @param hostName   Host to query (e.g. "MyDevice.local").
      */
-    void issueAddressQueries (const std::string& instanceName, const std::string& hostName);
+    void issueAddressQueries (const std::string& serviceKey, const std::string& hostName);
 
     /**
      * Issues one DnsQueryEx (A or AAAA) for the service, unless that query is already in flight.
@@ -219,7 +220,7 @@ private:
      */
     void issueAddressQuery (
         WindnsDiscoveredService& service,
-        const std::string& instanceName,
+        const std::string& serviceKey,
         const std::wstring& hostName,
         DWORD queryOptions,
         bool isIpv6);
@@ -230,20 +231,20 @@ private:
      * one of those three changes.
      * Then issues A/AAAA address queries.
      * Must be called with mLock held.
-     * @param instanceName Instance name.
-     * @param pInstance    Resolved instance data. Caller is responsible for calling DnsServiceFreeInstance.
+     * @param serviceKey Key of the service in mServices.
+     * @param pInstance  Resolved instance data. Caller is responsible for calling DnsServiceFreeInstance.
      */
-    void onResolveResult (const std::string& instanceName, PDNS_SERVICE_INSTANCE pInstance);
+    void onResolveResult (const std::string& serviceKey, PDNS_SERVICE_INSTANCE pInstance);
 
     /**
      * Processes a chain of A or AAAA DNS_RECORD results, inserting new addresses into
      * description.interfaces and firing onAddressAddedCallback for each new address.
      * Zero-TTL records trigger removal from the set and fire onAddressRemovedCallback.
      * Must be called with mLock held.
-     * @param instanceName Instance name.
-     * @param records      Chain of DNS_RECORD results (DNS_TYPE_A or DNS_TYPE_AAAA).
+     * @param serviceKey Key of the service in mServices.
+     * @param records    Chain of DNS_RECORD results (DNS_TYPE_A or DNS_TYPE_AAAA).
      */
-    void onAddressResult (const std::string& instanceName, PDNS_RECORD records);
+    void onAddressResult (const std::string& serviceKey, PDNS_RECORD records);
 
     /**
      * Reports an error via onBrowseErrorCallback if result.hasError().

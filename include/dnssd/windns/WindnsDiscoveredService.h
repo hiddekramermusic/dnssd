@@ -22,7 +22,8 @@ class WindnsBrowser;
 struct WindnsResolveRequest
 {
     WindnsBrowser* owner = nullptr;
-    std::string instanceName;
+    /// Key of the service in WindnsBrowser's service map.
+    std::string serviceKey;
     DNS_SERVICE_CANCEL cancel {};
 };
 
@@ -32,7 +33,8 @@ struct WindnsResolveRequest
 struct WindnsAddressQuery
 {
     WindnsBrowser* owner = nullptr;
-    std::string instanceName;
+    /// Key of the service in WindnsBrowser's service map.
+    std::string serviceKey;
     bool isIpv6 = false;
     /// Result struct kept alive until the async callback fires (pQueryResults == &result).
     DNS_QUERY_RESULT result {};
