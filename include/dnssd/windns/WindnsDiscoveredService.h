@@ -17,6 +17,22 @@ namespace dnssd
 class WindnsBrowser;
 
 /**
+ * One DnsServiceBrowse call: the request state, its cancel handle and its callback context.
+ */
+struct WindnsBrowseRequest
+{
+    WindnsBrowser* owner = nullptr;
+    /// Service type as passed to browseFor.
+    std::string serviceType;
+    /// Normalised query name, also the key of the request in WindnsBrowser's browse map.
+    std::wstring queryName;
+    DNS_SERVICE_CANCEL cancel {};
+    /// Callback context passed to DnsServiceBrowse. Deleted after the final callback, or when no final callback will
+    /// come.
+    std::shared_ptr<WindnsBrowseRequest>* context = nullptr;
+};
+
+/**
  * One DnsServiceResolve call: the request state and its cancel handle.
  */
 struct WindnsResolveRequest
@@ -58,6 +74,8 @@ struct WindnsDiscoveredService
 
     /// When the current DnsServiceResolve call was issued; used for the resolve timeout.
     std::chrono::steady_clock::time_point resolveStartedAt;
+    /// When A/AAAA queries were last issued for this service; default-constructed when never.
+    std::chrono::steady_clock::time_point lastAddressQueryAt;
 
     /// Resolves in a row that failed or timed out. Reset only by a successful resolve.
     int consecutiveResolveFailures = 0;

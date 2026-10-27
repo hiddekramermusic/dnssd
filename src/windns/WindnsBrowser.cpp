@@ -68,6 +68,31 @@ std::string makeServiceKey (const std::string& instanceName)
     return key;
 }
 
+/**
+ * Parses the strings of a TXT record into key/value pairs. A string without '=' is a key with an empty value. Empty
+ * strings are skipped, and when a key appears more than once the first occurrence is kept.
+ */
+dnssd::TxtRecord parseTxtStrings (const DNS_TXT_DATAW& txt)
+{
+    dnssd::TxtRecord txtRecord;
+    for (DWORD i = 0; i < txt.dwStringCount; ++i)
+    {
+        if (txt.pStringArray[i] == nullptr)
+            continue;
+
+        std::string entry;
+        if (dnssd::toNarrowString (txt.pStringArray[i], entry).hasError() || entry.empty())
+            continue;
+
+        const auto separator = entry.find ('=');
+        if (separator == std::string::npos)
+            txtRecord.emplace (entry, std::string());
+        else
+            txtRecord.emplace (entry.substr (0, separator), entry.substr (separator + 1));
+    }
+    return txtRecord;
+}
+
 } // namespace
 
 namespace dnssd
@@ -99,12 +124,16 @@ void WindnsBrowser::pollLoop()
             std::unique_lock<std::mutex> lk (mPollMutex);
             mPollCv.wait_until (lk, wakeAt, [this]() {
                 return mStopPollThread.load (std::memory_order_acquire)
-                       || mTxtPollIntervalChanged.load (std::memory_order_acquire);
+                       || mTxtPollIntervalChanged.load (std::memory_order_acquire)
+                       || mBrowseCancelRequested.load (std::memory_order_acquire);
             });
         }
 
         if (mStopPollThread.load (std::memory_order_acquire))
             break;
+
+        if (mBrowseCancelRequested.exchange (false, std::memory_order_acq_rel))
+            cancelFailedBrowses();
 
         const auto now = Clock::now();
 
@@ -255,7 +284,7 @@ WindnsBrowser::~WindnsBrowser()
 
     // Take everything out under mLock, then cancel without it.
     PendingCancels pending;
-    std::map<std::wstring, DNS_SERVICE_CANCEL> browseCancels; // swap keeps the nodes, so the handles do not move
+    std::vector<std::shared_ptr<WindnsBrowseRequest>> browses;
     {
         std::lock_guard<std::recursive_mutex> lg (mLock);
         mShuttingDown = true;
@@ -272,35 +301,55 @@ WindnsBrowser::~WindnsBrowser()
         }
         mServices.clear();
 
-        browseCancels.swap (mBrowseCancels);
+        for (auto& entry : mBrowses)
+            browses.push_back (std::move (entry.second));
+        mBrowses.clear();
+
+        browses.insert (browses.end(), mFailedBrowses.begin(), mFailedBrowses.end());
+        mFailedBrowses.clear();
     }
 
     // Cancelled resolves and address queries still call back (ERROR_CANCELLED);
     // mOutstandingCallbacks counts them, and we wait for them below.
     runCancels (pending);
 
-    // DnsServiceBrowseCancel results in one final browseCallback with ERROR_CANCELLED per browse,
-    // which we also wait for below.
-    {
-        std::lock_guard<std::mutex> lk (mCancelMutex);
-        mPendingBrowseCancels = static_cast<int> (browseCancels.size());
-    }
-    for (auto& entry : browseCancels)
-    {
-        DWORD res = DnsServiceBrowseCancel (&entry.second);
-        if (res != ERROR_SUCCESS && res != ERROR_CANCELLED)
-            DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: DnsServiceBrowseCancel failed: "
-                             << Result (static_cast<DNS_STATUS> (res)).description() << std::endl)
-    }
+    // A cancelled browse calls back once more with ERROR_CANCELLED; mOutstandingCallbacks counts that callback too.
+    for (auto& browse : browses)
+        cancelBrowse (browse);
+    browses.clear();
 
     std::unique_lock<std::mutex> lk (mCancelMutex);
-    bool completed = mCancelCv.wait_for (lk, kWindnsCallbackTimeout, [this]() {
-        return mPendingBrowseCancels == 0 && mOutstandingCallbacks == 0;
-    });
+    bool completed = mCancelCv.wait_for (lk, kWindnsCallbackTimeout, [this]() { return mOutstandingCallbacks == 0; });
     if (!completed)
-        DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: timed out waiting for callbacks (browse cancels: "
-                         << mPendingBrowseCancels << ", resolve/address queries: " << mOutstandingCallbacks << ")"
-                         << std::endl)
+        DNSSD_LOG_DEBUG ("WindnsBrowser::~WindnsBrowser: timed out waiting for " << mOutstandingCallbacks
+                         << " callbacks" << std::endl)
+}
+
+void WindnsBrowser::cancelBrowse (const std::shared_ptr<WindnsBrowseRequest>& request)
+{
+    DWORD res = DnsServiceBrowseCancel (&request->cancel);
+    if (res == ERROR_SUCCESS)
+        return; // the final ERROR_CANCELLED callback releases the context
+
+    DNSSD_LOG_DEBUG ("WindnsBrowser::cancelBrowse: DnsServiceBrowseCancel for " << request->serviceType << " returned "
+                     << Result (static_cast<DNS_STATUS> (res)).description() << ", no final callback expected"
+                     << std::endl)
+
+    delete request->context;
+    request->context = nullptr;
+    callbackFinished();
+}
+
+void WindnsBrowser::cancelFailedBrowses()
+{
+    std::vector<std::shared_ptr<WindnsBrowseRequest>> failed;
+    {
+        std::lock_guard<std::recursive_mutex> lg (mLock);
+        failed.swap (mFailedBrowses);
+    }
+
+    for (auto& request : failed)
+        cancelBrowse (request);
 }
 
 Result WindnsBrowser::browseFor (const std::string& serviceType)
@@ -320,24 +369,34 @@ Result WindnsBrowser::browseFor (const std::string& serviceType)
 
     std::lock_guard<std::recursive_mutex> lg (mLock);
 
-    if (mBrowseCancels.count (queryName) > 0)
+    if (mBrowses.count (queryName) > 0)
         return Result ("already browsing for service \"" + serviceType + "\"");
 
+    auto request = std::make_shared<WindnsBrowseRequest>();
+    request->owner = this;
+    request->serviceType = serviceType;
+    request->queryName = queryName;
+    request->context = new std::shared_ptr<WindnsBrowseRequest> (request);
 
     DNS_SERVICE_BROWSE_REQUEST req {};
     req.Version = DNS_QUERY_REQUEST_VERSION1;
     req.InterfaceIndex = 0; // all interfaces
-    req.QueryName = queryName.c_str();
+    req.QueryName = request->queryName.c_str();
     req.pBrowseCallback = &WindnsBrowser::browseCallback;
-    req.pQueryContext = this;
+    req.pQueryContext = request->context;
 
-    auto& it = mBrowseCancels.emplace (queryName, DNS_SERVICE_CANCEL {}).first;
+    // Set before the call: a callback can arrive before DnsServiceBrowse returns.
+    mBrowses.emplace (queryName, request);
+    callbackExpected();
 
-    DWORD status = DnsServiceBrowse (&req, &it->second);
+    DWORD status = DnsServiceBrowse (&req, &request->cancel);
 
     if (status != DNS_REQUEST_PENDING && status != ERROR_SUCCESS)
     {
-        mBrowseCancels.erase (it);
+        mBrowses.erase (queryName);
+        delete request->context;
+        request->context = nullptr;
+        callbackFinished();
         return Result (static_cast<DNS_STATUS> (status));
     }
 
@@ -350,23 +409,39 @@ Result WindnsBrowser::browseFor (const std::string& serviceType)
 
 VOID WINAPI WindnsBrowser::browseCallback (DWORD Status, PVOID pQueryContext, PDNS_RECORD pDnsRecord)
 {
-    auto* self = static_cast<WindnsBrowser*> (pQueryContext);
+    auto* holder = static_cast<std::shared_ptr<WindnsBrowseRequest>*> (pQueryContext);
 
     // Cancelling the browse request calls this callback one more time for cleanup.
     if (static_cast<DNS_STATUS> (Status) == ERROR_CANCELLED)
     {
-        std::lock_guard<std::mutex> lk (self->mCancelMutex);
-        --self->mPendingBrowseCancels;
-        self->mCancelCv.notify_all();
+        if (pDnsRecord != nullptr)
+            DnsRecordListFree (pDnsRecord, DnsFreeRecordList);
+
+        std::shared_ptr<WindnsBrowseRequest> request = std::move (*holder);
+        delete holder;
+        auto* self = request->owner;
+        request.reset();
+        self->callbackFinished(); // last access to self
         return;
     }
 
+    std::shared_ptr<WindnsBrowseRequest> request = *holder;
+    auto* self = request->owner;
+
     PendingCancels pending;
-    self->handleBrowseResults (Status, pDnsRecord, pending);
+    self->handleBrowseResults (request, Status, pDnsRecord, pending);
+
+    if (pDnsRecord != nullptr)
+        DnsRecordListFree (pDnsRecord, DnsFreeRecordList);
+
     self->runCancels (pending); // after mLock is released
 }
 
-void WindnsBrowser::handleBrowseResults (DWORD status, PDNS_RECORD pDnsRecord, PendingCancels& pending)
+void WindnsBrowser::handleBrowseResults (
+    const std::shared_ptr<WindnsBrowseRequest>& request,
+    DWORD status,
+    PDNS_RECORD pDnsRecord,
+    PendingCancels& pending)
 {
     std::lock_guard<std::recursive_mutex> lg (mLock);
 
@@ -377,8 +452,24 @@ void WindnsBrowser::handleBrowseResults (DWORD status, PDNS_RECORD pDnsRecord, P
 
     const auto now = std::chrono::steady_clock::now();
 
-    if (reportIfError (Result (static_cast<DNS_STATUS> (status))))
+    if (status != ERROR_SUCCESS)
+    {
+        reportIfError (Result ("Browsing for " + request->serviceType + " failed: "
+                               + Result (static_cast<DNS_STATUS> (status)).description()));
+
+        auto it = mBrowses.find (request->queryName);
+        if (it != mBrowses.end() && it->second == request)
+        {
+            mBrowses.erase (it);
+            mFailedBrowses.push_back (request);
+            {
+                std::lock_guard<std::mutex> lk (mPollMutex);
+                mBrowseCancelRequested.store (true, std::memory_order_release);
+            }
+            mPollCv.notify_one();
+        }
         return;
+    }
 
     for (PDNS_RECORD record = pDnsRecord; record != nullptr; record = record->pNext)
     {
@@ -457,7 +548,120 @@ void WindnsBrowser::handleBrowseResults (DWORD status, PDNS_RECORD pDnsRecord, P
         }
     }
 
+    applyBrowseServiceRecords (pDnsRecord);
+
     DNSSD_LOG_DEBUG ("< browseCallback exit" << std::endl)
+}
+
+void WindnsBrowser::applyBrowseServiceRecords (PDNS_RECORD pDnsRecord)
+{
+    // SRV records first, so that A and AAAA records in the same result can be matched on the host target.
+    for (PDNS_RECORD record = pDnsRecord; record != nullptr; record = record->pNext)
+    {
+        if ((record->wType != DNS_TYPE_SRV && record->wType != DNS_TYPE_TEXT) || record->pName == nullptr
+            || record->dwTtl == 0)
+            continue;
+
+        std::string instanceName;
+        if (toNarrowString (record->pName, instanceName).hasError())
+        {
+            DNSSD_LOG_DEBUG ("- applyBrowseServiceRecords: failed to convert record name" << std::endl)
+            continue;
+        }
+
+        const std::string serviceKey = makeServiceKey (instanceName);
+        if (mServices.find (serviceKey) == mServices.end())
+            continue;
+
+        if (record->wType == DNS_TYPE_SRV)
+        {
+            std::string hostTarget;
+            if (record->Data.SRV.pNameTarget == nullptr
+                || toNarrowString (record->Data.SRV.pNameTarget, hostTarget).hasError())
+            {
+                DNSSD_LOG_DEBUG ("- applyBrowseServiceRecords: failed to read SRV target of " << instanceName << std::endl)
+                continue;
+            }
+
+            const uint16_t port = record->Data.SRV.wPort;
+            DNSSD_LOG_DEBUG ("- applyBrowseServiceRecords: SRV " << instanceName << " host=" << hostTarget
+                             << " port=" << port << std::endl)
+            updateService (serviceKey, &hostTarget, &port, nullptr, 0);
+        }
+        else
+        {
+            const TxtRecord txtRecord = parseTxtStrings (record->Data.TXT);
+            DNSSD_LOG_DEBUG ("- applyBrowseServiceRecords: TXT " << instanceName << " (" << txtRecord.size()
+                             << " entries)" << std::endl)
+            updateService (serviceKey, nullptr, nullptr, &txtRecord, 0);
+        }
+    }
+
+    for (PDNS_RECORD record = pDnsRecord; record != nullptr; record = record->pNext)
+    {
+        if ((record->wType != DNS_TYPE_A && record->wType != DNS_TYPE_AAAA) || record->pName == nullptr)
+            continue;
+
+        std::string hostName;
+        if (toNarrowString (record->pName, hostName).hasError())
+        {
+            DNSSD_LOG_DEBUG ("- applyBrowseServiceRecords: failed to convert record name" << std::endl)
+            continue;
+        }
+
+        const std::string hostKey = makeServiceKey (hostName);
+        for (auto& entry : mServices)
+        {
+            const std::string& hostTarget = entry.second.description.hostTarget;
+            if (!hostTarget.empty() && makeServiceKey (hostTarget) == hostKey)
+                applyAddressRecord (entry.first, *record);
+        }
+    }
+}
+
+void WindnsBrowser::updateService (
+    const std::string& serviceKey,
+    const std::string* hostTarget,
+    const uint16_t* port,
+    const TxtRecord* txtRecord,
+    uint32_t interfaceIndex)
+{
+    auto it = mServices.find (serviceKey);
+    if (it == mServices.end())
+        return;
+
+    WindnsDiscoveredService& service = it->second;
+    ServiceDescription& desc = service.description;
+
+    const bool hostTargetChanged = hostTarget != nullptr && makeServiceKey (*hostTarget) != makeServiceKey (desc.hostTarget);
+    const bool portChanged = port != nullptr && *port != desc.port;
+    const bool txtRecordChanged = txtRecord != nullptr && *txtRecord != desc.txtRecord;
+
+    if (hostTargetChanged)
+        desc.hostTarget = *hostTarget;
+    if (portChanged)
+        desc.port = *port;
+    if (txtRecordChanged)
+        desc.txtRecord = *txtRecord;
+
+    if (!desc.hostTarget.empty() && desc.port != 0
+        && (!service.resolved || hostTargetChanged || portChanged || txtRecordChanged))
+    {
+        service.resolved = true;
+        if (onServiceResolvedCallback)
+            onServiceResolvedCallback (desc, interfaceIndex);
+    }
+
+    if (desc.hostTarget.empty())
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool neverQueried = service.lastAddressQueryAt == std::chrono::steady_clock::time_point();
+    if (hostTargetChanged || neverQueried || now - service.lastAddressQueryAt >= kLivenessInterval)
+    {
+        service.lastAddressQueryAt = now;
+        issueAddressQueries (serviceKey, desc.hostTarget);
+    }
 }
 
 VOID WINAPI WindnsBrowser::resolveCallback (DWORD Status, PVOID pQueryContext, PDNS_SERVICE_INSTANCE pInstance)
@@ -729,26 +933,24 @@ void WindnsBrowser::onResolveResult (const std::string& serviceKey, PDNS_SERVICE
     if (it == mServices.end())
         return;
 
-    WindnsDiscoveredService& service = it->second;
-    ServiceDescription& desc = service.description;
-
-    const std::string previousHostTarget = desc.hostTarget;
-    const uint16_t previousPort = desc.port;
-    const TxtRecord previousTxtRecord = desc.txtRecord;
-
+    std::string hostTarget;
+    const std::string* newHostTarget = nullptr;
     if (pInstance->pszHostName != nullptr)
     {
-        auto r = toNarrowString (pInstance->pszHostName, desc.hostTarget);
+        auto r = toNarrowString (pInstance->pszHostName, hostTarget);
         if (r.hasError())
         {
-            reportIfError (Result ("Reading the host name of " + desc.fullname + " failed: " + r.description()));
+            reportIfError (Result ("Reading the host name of " + it->second.description.fullname + " failed: "
+                                   + r.description()));
             return;
         }
+        newHostTarget = &hostTarget;
     }
 
-    desc.port = pInstance->wPort;
+    const uint16_t port = pInstance->wPort;
+    const uint32_t ifIndex = pInstance->dwInterfaceIndex;
 
-    desc.txtRecord.clear();
+    TxtRecord txtRecord;
     for (DWORD i = 0; i < pInstance->dwPropertyCount; ++i)
     {
         if (pInstance->keys == nullptr || pInstance->keys[i] == nullptr)
@@ -772,123 +974,99 @@ void WindnsBrowser::onResolveResult (const std::string& serviceKey, PDNS_SERVICE
             }
         }
 
-        desc.txtRecord[key] = value;
+        txtRecord.emplace (key, value);
     }
 
-    DNSSD_LOG_DEBUG ("- onResolveResult: " << serviceKey << " host=" << desc.hostTarget << " port=" << desc.port << std::endl)
+    DNSSD_LOG_DEBUG ("- onResolveResult: " << serviceKey << " host=" << hostTarget << " port=" << port << std::endl)
 
-    const bool changed = desc.hostTarget != previousHostTarget || desc.port != previousPort
-                         || desc.txtRecord != previousTxtRecord;
-
-    if (!service.resolved || changed)
-    {
-        service.resolved = true;
-        if (onServiceResolvedCallback)
-            onServiceResolvedCallback (desc, pInstance->dwInterfaceIndex);
-    }
-
-    // Bonjour includes A/AAAA records as additional records in the mDNS SRV response, which
-    // DnsServiceResolve populates into ip4Address/ip6Address. Use them directly to avoid a
-    // separate DnsQueryEx round-trip, which does not reliably resolve .local names via mDNS.
-    bool hasAddresses = false;
-    const uint32_t ifIndex = pInstance->dwInterfaceIndex;
+    updateService (serviceKey, newHostTarget, &port, &txtRecord, ifIndex);
 
     if (pInstance->ip4Address != nullptr)
     {
         char buf[INET_ADDRSTRLEN];
         if (inet_ntop (AF_INET, pInstance->ip4Address, buf, sizeof (buf)) != nullptr)
-        {
-            std::string address = buf;
-            if (desc.interfaces[ifIndex].insert (address).second)
-            {
-                DNSSD_LOG_DEBUG ("- onResolveResult: added IPv4 " << address << " for " << serviceKey << std::endl)
-                if (onAddressAddedCallback)
-                    onAddressAddedCallback (desc, address, ifIndex);
-            }
-            hasAddresses = true;
-        }
+            addAddress (serviceKey, ifIndex, buf);
     }
 
     if (pInstance->ip6Address != nullptr)
     {
         char buf[INET6_ADDRSTRLEN];
         if (inet_ntop (AF_INET6, pInstance->ip6Address, buf, sizeof (buf)) != nullptr)
-        {
-            std::string address = buf;
-            if (desc.interfaces[ifIndex].insert (address).second)
-            {
-                DNSSD_LOG_DEBUG ("- onResolveResult: added IPv6 " << address << " for " << serviceKey << std::endl)
-                if (onAddressAddedCallback)
-                    onAddressAddedCallback (desc, address, ifIndex);
-            }
-            hasAddresses = true;
-        }
+            addAddress (serviceKey, ifIndex, buf);
     }
-
-    if (!hasAddresses && !desc.hostTarget.empty())
-        issueAddressQueries (serviceKey, desc.hostTarget);
 }
 
 void WindnsBrowser::onAddressResult (const std::string& serviceKey, PDNS_RECORD records)
+{
+    for (PDNS_RECORD record = records; record != nullptr; record = record->pNext)
+        applyAddressRecord (serviceKey, *record);
+}
+
+void WindnsBrowser::applyAddressRecord (const std::string& serviceKey, const DNS_RECORD& record)
+{
+    auto it = mServices.find (serviceKey);
+    if (it == mServices.end())
+        return;
+
+    std::string address;
+
+    if (record.wType == DNS_TYPE_A)
+    {
+        char buf[INET_ADDRSTRLEN];
+        DWORD ipAddr = record.Data.A.IpAddress;
+        if (inet_ntop (AF_INET, &ipAddr, buf, sizeof (buf)) == nullptr)
+            return;
+        address = buf;
+    }
+    else if (record.wType == DNS_TYPE_AAAA)
+    {
+        char buf[INET6_ADDRSTRLEN];
+        if (inet_ntop (AF_INET6, &record.Data.AAAA.Ip6Address, buf, sizeof (buf)) == nullptr)
+            return;
+        address = buf;
+    }
+    else
+    {
+        return;
+    }
+
+    const uint32_t ifIndex = 0;
+
+    if (record.dwTtl != 0)
+    {
+        addAddress (serviceKey, ifIndex, address);
+        return;
+    }
+
+    ServiceDescription& desc = it->second.description;
+    auto ifIt = desc.interfaces.find (ifIndex);
+    if (ifIt != desc.interfaces.end() && ifIt->second.erase (address) > 0)
+    {
+        if (ifIt->second.empty())
+            desc.interfaces.erase (ifIt);
+
+        DNSSD_LOG_DEBUG ("- applyAddressRecord: removed " << address << " for " << serviceKey << std::endl)
+
+        if (onAddressRemovedCallback)
+            onAddressRemovedCallback (desc, address, ifIndex);
+    }
+}
+
+void WindnsBrowser::addAddress (const std::string& serviceKey, uint32_t interfaceIndex, const std::string& address)
 {
     auto it = mServices.find (serviceKey);
     if (it == mServices.end())
         return;
 
     ServiceDescription& desc = it->second.description;
-    const uint32_t ifIndex = 0;
+    if (!desc.interfaces[interfaceIndex].insert (address).second)
+        return;
 
-    for (PDNS_RECORD record = records; record != nullptr; record = record->pNext)
-    {
-        std::string address;
+    DNSSD_LOG_DEBUG ("- addAddress: added " << address << " for " << serviceKey << " on interface " << interfaceIndex
+                     << std::endl)
 
-        if (record->wType == DNS_TYPE_A)
-        {
-            char buf[INET_ADDRSTRLEN];
-            DWORD ipAddr = record->Data.A.IpAddress;
-            if (inet_ntop (AF_INET, &ipAddr, buf, sizeof (buf)) == nullptr)
-                continue;
-            address = buf;
-        }
-        else if (record->wType == DNS_TYPE_AAAA)
-        {
-            char buf[INET6_ADDRSTRLEN];
-            if (inet_ntop (AF_INET6, &record->Data.AAAA.Ip6Address, buf, sizeof (buf)) == nullptr)
-                continue;
-            address = buf;
-        }
-        else
-        {
-            continue;
-        }
-
-        // Goodbye message for a specific interface
-        if (record->dwTtl == 0)
-        {
-            auto ifIt = desc.interfaces.find (ifIndex);
-            if (ifIt != desc.interfaces.end() && ifIt->second.erase (address) > 0)
-            {
-                if (ifIt->second.empty())
-                    desc.interfaces.erase (ifIt);
-
-                DNSSD_LOG_DEBUG ("- onAddressResult: removed " << address << " for " << serviceKey << std::endl)
-
-                if (onAddressRemovedCallback)
-                    onAddressRemovedCallback (desc, address, ifIndex);
-            }
-        }
-        else
-        {
-            bool inserted = desc.interfaces[ifIndex].insert (address).second;
-            if (inserted)
-            {
-                DNSSD_LOG_DEBUG ("- onAddressResult: added " << address << " for " << serviceKey << std::endl)
-
-                if (onAddressAddedCallback)
-                    onAddressAddedCallback (desc, address, ifIndex);
-            }
-        }
-    }
+    if (onAddressAddedCallback)
+        onAddressAddedCallback (desc, address, interfaceIndex);
 }
 
 bool WindnsBrowser::reportIfError (const Result& result) const noexcept

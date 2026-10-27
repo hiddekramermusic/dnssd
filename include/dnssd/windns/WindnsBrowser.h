@@ -34,10 +34,11 @@ constexpr int kMaxResolveFailures = 3;
  * Only the .local mDNS domain is supported; custom domains are not available via this API.
  *
  * Discovery is performed in async stages:
- *   1. DnsServiceBrowse   — finds PTR records, fires onServiceDiscovered / onServiceRemoved
- *   2. DnsServiceResolve  — resolves host, port, TXT, and (if included) addresses via ip4Address /
- *                           ip6Address on DNS_SERVICE_INSTANCE; fires onServiceResolved and onAddressAdded
- *   3. DnsQueryEx (A/AAAA) — fallback address query when DnsServiceResolve does not include addresses
+ *   1. DnsServiceBrowse   — PTR records fire onServiceDiscovered / onServiceRemoved; SRV, TXT, A and AAAA records in
+ *                           the same result are applied to the matching services
+ *   2. DnsServiceResolve  — resolves host, port, TXT, and (if included) one IPv4 and one IPv6 address;
+ *                           fires onServiceResolved and onAddressAdded
+ *   3. DnsQueryEx (A/AAAA) — queries all addresses of the host target; fires onAddressAdded / onAddressRemoved
  *
  * Liveness: every known service is re-resolved every kLivenessInterval. A service is removed (onServiceRemoved fires)
  * after kMaxResolveFailures failed or unanswered resolves in a row, or when it has not been seen within its PTR TTL.
@@ -87,9 +88,13 @@ private:
     std::atomic<uint32_t> mTxtPollIntervalMs { 1000 };
     std::atomic<bool> mStopPollThread { false };
     std::atomic<bool> mTxtPollIntervalChanged { false }; // wakes pollLoop to reschedule the TXT poll
+    std::atomic<bool> mBrowseCancelRequested { false }; // wakes pollLoop to cancel failed browses
 
-    /// One cancel handle per browsed service type, keyed by wide-string service type.
-    std::map<std::wstring, DNS_SERVICE_CANCEL> mBrowseCancels;
+    /// The active browse per service type, keyed by normalised query name. Guarded by mLock.
+    std::map<std::wstring, std::shared_ptr<WindnsBrowseRequest>> mBrowses;
+
+    /// Failed browses, removed from mBrowses and waiting to be cancelled by pollLoop. Guarded by mLock.
+    std::vector<std::shared_ptr<WindnsBrowseRequest>> mFailedBrowses;
 
     /// All currently known service instances, keyed by instance name in ASCII lowercase without trailing dots.
     /// The name as received from browse is kept in ServiceDescription::fullname.
@@ -102,10 +107,9 @@ private:
     bool mShuttingDown = false;
 
     /// Synchronises the destructor with callbacks that are still to come: the final ERROR_CANCELLED browseCallback per
-    /// active browse, and one callback per issued resolve and address query. Both counters are guarded by mCancelMutex.
+    /// browse, and one callback per issued resolve and address query. Guarded by mCancelMutex.
     std::mutex mCancelMutex;
     std::condition_variable mCancelCv;
-    int mPendingBrowseCancels = 0;
     int mOutstandingCallbacks = 0;
 
     /**
@@ -120,10 +124,11 @@ private:
     // -- Static WINAPI callbacks (invoked on WinDNS thread-pool threads) --
 
     /**
-     * Fired by DnsServiceBrowse when PTR records are discovered or removed.
+     * Fired by DnsServiceBrowse for each set of results, and once more with ERROR_CANCELLED after the browse is
+     * cancelled.
      * @param Status        DNS status code (ERROR_SUCCESS on success).
-     * @param pQueryContext Pointer to the WindnsBrowser instance (passed as 'this' in browseFor).
-     * @param pDnsRecord    Chain of DNS_RECORD results (DNS_TYPE_PTR). Freed by WinDNS after callback returns.
+     * @param pQueryContext Heap-allocated std::shared_ptr<WindnsBrowseRequest>.
+     * @param pDnsRecord    Chain of DNS_RECORD results. Freed by this callback.
      */
     static VOID WINAPI browseCallback (DWORD Status, PVOID pQueryContext, PDNS_RECORD pDnsRecord);
 
@@ -147,8 +152,27 @@ private:
     /**
      * Applies browse results: adds newly discovered services, refreshes known ones and removes services that sent a
      * goodbye. The in-flight requests of removed services are added to `pending`.
+     * On an error status the browse is moved from mBrowses to mFailedBrowses, so that browseFor accepts its service
+     * type again.
      */
-    void handleBrowseResults (DWORD status, PDNS_RECORD pDnsRecord, PendingCancels& pending);
+    void handleBrowseResults (
+        const std::shared_ptr<WindnsBrowseRequest>& request,
+        DWORD status,
+        PDNS_RECORD pDnsRecord,
+        PendingCancels& pending);
+
+    /**
+     * Cancels a browse that is no longer in mBrowses. If no final ERROR_CANCELLED callback will come, releases the
+     * callback context and its callbackExpected() registration.
+     * Must not be called with mLock held, nor from a callback of the same browse.
+     */
+    void cancelBrowse (const std::shared_ptr<WindnsBrowseRequest>& request);
+
+    /**
+     * Cancels every browse in mFailedBrowses.
+     * Must not be called with mLock held.
+     */
+    void cancelFailedBrowses();
 
     /**
      * Applies the result of a DnsServiceResolve call to its service.
@@ -167,7 +191,8 @@ private:
     void runCancels (PendingCancels& pending);
 
     /**
-     * Registers that a WinDNS callback is expected (resolve or address query). Call before issuing the request.
+     * Registers that a WinDNS callback is expected: the final callback of a browse, or the callback of a resolve or
+     * address query. Call before issuing the request.
      */
     void callbackExpected();
 
@@ -226,10 +251,33 @@ private:
         bool isIpv6);
 
     /**
-     * Processes a resolved DNS_SERVICE_INSTANCE, populating hostTarget, port, and txtRecord
-     * on the matching service. Fires onServiceResolvedCallback on the first resolve and whenever
-     * one of those three changes.
-     * Then issues A/AAAA address queries.
+     * Applies the SRV, TXT, A and AAAA records of a browse result to the services they belong to. SRV and TXT records
+     * are matched on instance name, A and AAAA records on the host target of each service.
+     * Must be called with mLock held.
+     */
+    void applyBrowseServiceRecords (PDNS_RECORD pDnsRecord);
+
+    /**
+     * Applies a host target, port and/or TXT record to a service. Once host target and port are both known, fires
+     * onServiceResolvedCallback the first time and whenever one of the three changes. Issues A/AAAA address queries
+     * when the host target changes, and otherwise at most once every kLivenessInterval.
+     * Must be called with mLock held.
+     * @param serviceKey     Key of the service in mServices.
+     * @param hostTarget     New host target, or nullptr to leave it unchanged.
+     * @param port           New port, or nullptr to leave it unchanged.
+     * @param txtRecord      New TXT record, or nullptr to leave it unchanged.
+     * @param interfaceIndex Interface index passed to onServiceResolvedCallback.
+     */
+    void updateService (
+        const std::string& serviceKey,
+        const std::string* hostTarget,
+        const uint16_t* port,
+        const TxtRecord* txtRecord,
+        uint32_t interfaceIndex);
+
+    /**
+     * Processes a resolved DNS_SERVICE_INSTANCE: applies its host target, port and TXT record through updateService
+     * and adds its IPv4 and IPv6 address.
      * Must be called with mLock held.
      * @param serviceKey Key of the service in mServices.
      * @param pInstance  Resolved instance data. Caller is responsible for calling DnsServiceFreeInstance.
@@ -237,14 +285,26 @@ private:
     void onResolveResult (const std::string& serviceKey, PDNS_SERVICE_INSTANCE pInstance);
 
     /**
-     * Processes a chain of A or AAAA DNS_RECORD results, inserting new addresses into
-     * description.interfaces and firing onAddressAddedCallback for each new address.
-     * Zero-TTL records trigger removal from the set and fire onAddressRemovedCallback.
+     * Processes a chain of A or AAAA DNS_RECORD results through applyAddressRecord.
      * Must be called with mLock held.
      * @param serviceKey Key of the service in mServices.
      * @param records    Chain of DNS_RECORD results (DNS_TYPE_A or DNS_TYPE_AAAA).
      */
     void onAddressResult (const std::string& serviceKey, PDNS_RECORD records);
+
+    /**
+     * Adds the address of an A or AAAA record to the service under interface index 0 and fires onAddressAddedCallback
+     * if it is new. A zero-TTL record removes the address and fires onAddressRemovedCallback. Other record types are
+     * ignored.
+     * Must be called with mLock held.
+     */
+    void applyAddressRecord (const std::string& serviceKey, const DNS_RECORD& record);
+
+    /**
+     * Adds an address to the service and fires onAddressAddedCallback if it is new.
+     * Must be called with mLock held.
+     */
+    void addAddress (const std::string& serviceKey, uint32_t interfaceIndex, const std::string& address);
 
     /**
      * Reports an error via onBrowseErrorCallback if result.hasError().
@@ -253,8 +313,8 @@ private:
     bool reportIfError (const Result& result) const noexcept;
 
     /**
-     * Background thread body: runs the liveness check every kLivenessInterval and re-resolves services every
-     * mTxtPollIntervalMs (when non-zero), until mStopPollThread is set.
+     * Background thread body: runs the liveness check every kLivenessInterval, re-resolves services every
+     * mTxtPollIntervalMs (when non-zero) and cancels failed browses, until mStopPollThread is set.
      */
     void pollLoop();
 };

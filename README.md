@@ -119,12 +119,22 @@ The liveness check always runs, also when TXT polling is disabled. The interval 
 
 `onServiceDiscovered` fires as soon as the PTR record is seen, before the service is resolved. `hostTarget` is empty and `port` is 0 until `onServiceResolved` has fired.
 
+### Browse results (browser)
+
+Besides PTR records, a browse result can contain SRV, TXT, A and AAAA records. The browser applies them to the matching services directly: SRV and TXT records by instance name, A and AAAA records by the host target of the service.
+
+If a browse reports an error, it is reported through `onBrowseError` with the service type in the message, and the browse is cancelled. `browseFor` can then be called again for that service type to restart it.
+
+### Addresses (browser)
+
+`DnsServiceResolve` returns at most one IPv4 and one IPv6 address. To find all addresses of a service, the browser also queries the A and AAAA records of the host target: when the host target is first known or changes, and after that at most once every `kLivenessInterval`. Addresses from the resolve are reported with the interface index of the resolve, addresses from browse results and address queries with interface index 0. An address is removed when an A or AAAA record with TTL 0 is received for it.
+
 ### TXT record update detection (browser)
 
 The Windns API has no record-change subscription mechanism equivalent to Bonjour's `DNSServiceQueryRecord`. As a result, TXT record updates announced by remote peers (e.g. a Bonjour service on macOS) are not detected automatically.
 
 To work around this, `WindnsBrowser` (and the `Browser` example when built with `USE_WINDNS`) re-resolves every known service periodically. The interval is set with `setTxtPollIntervalMs`; passing 0 disables TXT polling.
-`onServiceResolved` fires on the first successful resolve, and after that only when the host target, port or TXT record has changed.
+`onServiceResolved` fires once the host target and port are known, from a resolve or from a browse result, and after that only when the host target, port or TXT record has changed.
 
 If you use the default constructor of the WindnsBrowser the interval is set to 1000ms. The background thread starts when you start browsing for a service, and runs until the browser is destroyed.
 
