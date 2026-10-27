@@ -60,6 +60,9 @@ struct WindnsDiscoveredService
     /// Resolves in a row that failed or timed out. Reset only by a successful resolve.
     int consecutiveResolveFailures = 0;
 
+    /// True once onServiceResolved has fired for this service.
+    bool resolved = false;
+
     /// The in-flight DnsServiceResolve call, or nullptr.
     std::shared_ptr<WindnsResolveRequest> resolve;
 

@@ -109,14 +109,20 @@ void WindnsBrowser::pollLoop()
                 checkLiveness (now, pending);
             }
             runCancels (pending);
-            nextLiveness = now + kLivenessInterval;
         }
 
         if (txtPollDue)
             nextTxtPoll = now + std::chrono::milliseconds (txtIntervalMs);
 
-        std::lock_guard<std::recursive_mutex> lg (mLock);
-        resolveIdleServices();
+        {
+            std::lock_guard<std::recursive_mutex> lg (mLock);
+            resolveIdleServices();
+        }
+
+        // Scheduled after the resolves are issued, so that each of them has been in flight for at least
+        // kLivenessInterval when the next liveness check runs.
+        if (livenessDue)
+            nextLiveness = Clock::now() + kLivenessInterval;
     }
 }
 
@@ -691,7 +697,12 @@ void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVI
     if (it == mServices.end())
         return;
 
-    ServiceDescription& desc = it->second.description;
+    WindnsDiscoveredService& service = it->second;
+    ServiceDescription& desc = service.description;
+
+    const std::string previousHostTarget = desc.hostTarget;
+    const uint16_t previousPort = desc.port;
+    const TxtRecord previousTxtRecord = desc.txtRecord;
 
     if (pInstance->pszHostName != nullptr)
     {
@@ -731,8 +742,15 @@ void WindnsBrowser::onResolveResult (const std::string& instanceName, PDNS_SERVI
 
     DNSSD_LOG_DEBUG ("- onResolveResult: " << instanceName << " host=" << desc.hostTarget << " port=" << desc.port << std::endl)
 
-    if (onServiceResolvedCallback)
-        onServiceResolvedCallback (desc, pInstance->dwInterfaceIndex);
+    const bool changed = desc.hostTarget != previousHostTarget || desc.port != previousPort
+                         || desc.txtRecord != previousTxtRecord;
+
+    if (!service.resolved || changed)
+    {
+        service.resolved = true;
+        if (onServiceResolvedCallback)
+            onServiceResolvedCallback (desc, pInstance->dwInterfaceIndex);
+    }
 
     // Bonjour includes A/AAAA records as additional records in the mDNS SRV response, which
     // DnsServiceResolve populates into ip4Address/ip6Address. Use them directly to avoid a

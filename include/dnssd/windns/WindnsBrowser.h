@@ -72,7 +72,7 @@ public:
      * The WinDNS API has no record-change subscription, so polling is the only reliable way
      * to pick up TXT changes announced by remote peers (e.g. Bonjour on macOS).
      * Each poll re-issues DnsServiceResolve for every known service and fires
-     * onServiceResolved if the TXT record has changed.
+     * onServiceResolved if the host target, port or TXT record has changed.
      *
      * Can be called at any time; the new interval takes effect immediately.
      *
@@ -226,7 +226,8 @@ private:
 
     /**
      * Processes a resolved DNS_SERVICE_INSTANCE, populating hostTarget, port, and txtRecord
-     * on the matching service and firing onServiceResolvedCallback.
+     * on the matching service. Fires onServiceResolvedCallback on the first resolve and whenever
+     * one of those three changes.
      * Then issues A/AAAA address queries.
      * Must be called with mLock held.
      * @param instanceName Instance name.
