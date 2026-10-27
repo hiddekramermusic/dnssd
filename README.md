@@ -94,18 +94,39 @@ After this you end up with two test command line utilities and a libray.
 
 You need to link the following libraries on windows to use Windns: ws2_32.lib dnsapi.lib iphlpapi.lib
 
+### Registration lifetime (advertiser)
+
+`registerService` returns before Windns has finished the registration. If `unregisterService` is called, or the advertiser is destroyed, while the registration is still pending, the registration is cancelled.
+
+A Windns registration lasts until it is deregistered or the process exits. Destroying the advertiser deregisters the service.
+
 ### TXT record update broadcasting (advertiser)
 Windns has some slight differences compared to Bonjour in how they handle updating records, as dynamic record updates are not supported.
 Instead, this library deregisters the current service, and reregisters the service with the new TXT record.
+The Windns browser reports the update through `onServiceResolved` with the new TXT record; the service is not removed.
+
+If `updateTxtRecord` is called while a registration is still pending, the pending registration is cancelled and the service is registered with the new TXT record.
+
+### Service removal (browser)
+
+A service is removed, and `onServiceRemoved` fires, in these cases:
+
+- The browser receives a goodbye packet (a PTR record with TTL 0) for it. This happens when the advertiser deregisters the service.
+- The liveness check fails. Every 5 seconds the browser re-resolves each known service. A resolve that is still unanswered at the next check counts as a failure, and so does a resolve that returns an error. After 3 failures in a row the service is removed. A service that disappears without a goodbye packet (for example when the advertising process is killed) is removed about 15–20 seconds later.
+- The service has not been seen within the TTL of its PTR record.
+
+The liveness check always runs, also when TXT polling is disabled. The interval and the number of failures are the constants `kLivenessInterval` and `kMaxResolveFailures` in `WindnsBrowser.h`.
+
+`onServiceDiscovered` fires as soon as the PTR record is seen, before the service is resolved. `hostTarget` is empty and `port` is 0 until `onServiceResolved` has fired.
 
 ### TXT record update detection (browser)
 
 The Windns API has no record-change subscription mechanism equivalent to Bonjour's `DNSServiceQueryRecord`. As a result, TXT record updates announced by remote peers (e.g. a Bonjour service on macOS) are not detected automatically.
 
-To work around this, `WindnsBrowser` (and the `Browser` example when built with `USE_WINDNS`) provides opt-out (by passing 0 as an interval) periodic re-resolution via `setTxtPollIntervalMs`. 
-When enabled, the browser re-issues `DnsServiceResolve` for every known service at the given interval and fires `onServiceResolved` if the TXT record has changed.
+To work around this, `WindnsBrowser` (and the `Browser` example when built with `USE_WINDNS`) re-resolves every known service periodically. The interval is set with `setTxtPollIntervalMs`; passing 0 disables TXT polling.
+`onServiceResolved` fires on the first successful resolve, and after that only when the host target, port or TXT record has changed.
 
-If you use the default constructor of the WindnsBrowser the interval is set to 1000ms, and the background thread is started after you start browsing for a service.
+If you use the default constructor of the WindnsBrowser the interval is set to 1000ms. The background thread starts when you start browsing for a service, and runs until the browser is destroyed.
 
 If you want to change it you can either use the constructor, or change the interval on the fly (thread safe).
 
@@ -128,12 +149,12 @@ dnssd::Browser browser { 0 };
 browser.browseFor("_http._tcp");
 ```
 
-You can stop the background thread at any moment by setting the interval to 0, it will restart if you set any interval above 0:
+You can disable or re-enable TXT polling at any moment. The liveness check keeps running either way:
 ```cpp
 dnssd::Browser browser { 2000 };
 browser.browseFor("_http._tcp");
 /// Do some work
-browser.setTxtPollIntervalMs (0); // Stops the background thread
+browser.setTxtPollIntervalMs (0); // Stops TXT polling
 ```
 
 Choose the interval based on how quickly you need to detect changes, and based on the performance you get, 1000 ms is the reasonable default.

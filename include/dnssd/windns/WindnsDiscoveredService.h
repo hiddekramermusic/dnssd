@@ -7,8 +7,39 @@
 #include "Windns.h"
 #include "dnssd/ServiceDescription.h"
 
+#include <chrono>
+#include <memory>
+#include <string>
+
 namespace dnssd
 {
+
+class WindnsBrowser;
+
+/**
+ * One DnsServiceResolve call: the request state and its cancel handle.
+ */
+struct WindnsResolveRequest
+{
+    WindnsBrowser* owner = nullptr;
+    /// Key of the service in WindnsBrowser's service map.
+    std::string serviceKey;
+    DNS_SERVICE_CANCEL cancel {};
+};
+
+/**
+ * One DnsQueryEx A or AAAA call: the request state, its result and its cancel handle.
+ */
+struct WindnsAddressQuery
+{
+    WindnsBrowser* owner = nullptr;
+    /// Key of the service in WindnsBrowser's service map.
+    std::string serviceKey;
+    bool isIpv6 = false;
+    /// Result struct kept alive until the async callback fires (pQueryResults == &result).
+    DNS_QUERY_RESULT result {};
+    DNS_QUERY_CANCEL cancel {};
+};
 
 /**
  * Tracks all resolved state for a single discovered service instance.
@@ -18,30 +49,30 @@ struct WindnsDiscoveredService
     /// The service description, filled incrementally as queries complete.
     ServiceDescription description;
 
-    /// TTL from the PTR record; used for goodbye packet detection (zero TTL = removal).
+    /// TTL in seconds from the most recent PTR record. A zero TTL (goodbye) removes the service; otherwise the service
+    /// is pruned when it has not been seen for longer than this.
     DWORD ttl = 0;
 
-    /// Cancel handle for the in-flight DnsServiceResolve call.
-    DNS_SERVICE_CANCEL resolveCancel {};
+    /// Last time the service was confirmed alive: a non-goodbye PTR record or a successful resolve.
+    std::chrono::steady_clock::time_point lastSeen;
 
-    /// Cancel handle for the in-flight A record (IPv4) query.
-    DNS_QUERY_CANCEL aCancel {};
+    /// When the current DnsServiceResolve call was issued; used for the resolve timeout.
+    std::chrono::steady_clock::time_point resolveStartedAt;
 
-    /// Cancel handle for the in-flight AAAA record (IPv6) query.
-    DNS_QUERY_CANCEL aaaaCancel {};
+    /// Resolves in a row that failed or timed out. Reset only by a successful resolve.
+    int consecutiveResolveFailures = 0;
 
-    /// True once DnsServiceResolve has been called (cancel handle is live).
-    bool resolveStarted = false;
+    /// True once onServiceResolved has fired for this service.
+    bool resolved = false;
 
-    /// True once the DnsServiceResolve callback has fired (success or failure).
-    /// Indicates the cancel handle is no longer live; hostTarget is populated only on success.
-    bool resolveFinished = false;
+    /// The in-flight DnsServiceResolve call, or nullptr.
+    std::shared_ptr<WindnsResolveRequest> resolve;
 
-    /// True while a DnsQueryEx A (IPv4) call is in-flight (cancel handle is live).
-    bool aQueryInFlight = false;
+    /// The in-flight A record (IPv4) query, or nullptr.
+    std::shared_ptr<WindnsAddressQuery> aQuery;
 
-    /// True while a DnsQueryEx AAAA (IPv6) call is in-flight (cancel handle is live).
-    bool aaaaQueryInFlight = false;
+    /// The in-flight AAAA record (IPv6) query, or nullptr.
+    std::shared_ptr<WindnsAddressQuery> aaaaQuery;
 };
 
 } // namespace dnssd

@@ -8,6 +8,7 @@
 #include "dnssd/common/AdvertiserBase.h"
 #include "dnssd/common/Result.h"
 #include "dnssd/common/Log.h"
+#include <atomic>
 #include <mutex>
 #include <condition_variable>
 
@@ -46,12 +47,11 @@ public:
 private:
     DNS_SERVICE_REGISTER_REQUEST mReq { 0 };
     RegisterRequestContext mCtx {};
-    PDNS_SERVICE_CANCEL mCancelPtr = nullptr;
+    DNS_SERVICE_CANCEL mRegisterCancel {}; // Filled by DnsServiceRegister, used by DnsServiceRegisterCancel
     TxtRecord mTxtRecord;
 
-    bool mCallbackPending = false;
-    bool mCallbackFinished = false;
-    std::atomic<bool> mRegistered = false;
+    bool mCallbackPending = false; // Guarded by mLock. True while a register or deregister callback is outstanding.
+    std::atomic<bool> mRegistered { false };
 
     std::mutex mLock; // For synchronisation with the callback
     std::condition_variable mCv; // For synchronisation with the callback
@@ -59,9 +59,19 @@ private:
 	static VOID WINAPI registerCompleteCallback (DWORD Status, PVOID pQueryContext, PDNS_SERVICE_INSTANCE pInstance);
 
     /**
-    * Used by registerCompleteCallback to synchronise with the destructor.
+    * Used by registerCompleteCallback to synchronise with unregisterService.
     */
     void onCallbackFinished();
+
+    /**
+    * @return true if a DnsServiceRegister call is waiting for its completion callback.
+    */
+    bool isRegistrationPending();
+
+    /**
+    * Cancels a pending registration. If the cancel fails, waits up to kWindnsCallbackTimeout for the register callback.
+    */
+    void cancelPendingRegistration() noexcept;
 };
 
 } // namespace dnssd

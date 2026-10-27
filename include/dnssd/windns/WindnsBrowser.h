@@ -11,14 +11,23 @@
 #include "dnssd/common/Result.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace dnssd
 {
+
+/// Interval of the WinDNS browser liveness check, and the time after which an unanswered resolve counts as a failure.
+constexpr std::chrono::milliseconds kLivenessInterval { 5000 };
+
+/// Resolve failures in a row after which the WinDNS browser removes a service.
+constexpr int kMaxResolveFailures = 3;
 
 /**
  * Windows native DNS-SD implementation of BrowserBase using the WinDNS API (windns.h).
@@ -30,6 +39,9 @@ namespace dnssd
  *                           ip6Address on DNS_SERVICE_INSTANCE; fires onServiceResolved and onAddressAdded
  *   3. DnsQueryEx (A/AAAA) — fallback address query when DnsServiceResolve does not include addresses
  *
+ * Liveness: every known service is re-resolved every kLivenessInterval. A service is removed (onServiceRemoved fires)
+ * after kMaxResolveFailures failed or unanswered resolves in a row, or when it has not been seen within its PTR TTL.
+ *
  * All WinDNS callbacks arrive on thread-pool threads; mLock serialises access to mServices.
  */
 class WindnsBrowser : public BrowserBase
@@ -38,10 +50,10 @@ public:
     explicit WindnsBrowser() = default;
 
     /**
-    * Sets up the browser with a custom TXT polling interval, if the interval is 0 the TXT polling loop
-    * is not started - which can save CPU if you don't need the TXT records.
-    * 
-    * @param txtPollIntervalMs - the interval in milliseconds that the TXT polling background thread uses.
+    * Sets up the browser with a custom TXT polling interval. If the interval is 0, services are not re-resolved for
+    * TXT updates; the liveness check keeps running.
+    *
+    * @param txtPollIntervalMs - the interval in milliseconds between TXT polls.
     */
     explicit WindnsBrowser (uint32_t txtPollIntervalMs) : mTxtPollIntervalMs (txtPollIntervalMs) {};
 
@@ -60,51 +72,49 @@ public:
      * The WinDNS API has no record-change subscription, so polling is the only reliable way
      * to pick up TXT changes announced by remote peers (e.g. Bonjour on macOS).
      * Each poll re-issues DnsServiceResolve for every known service and fires
-     * onServiceResolved if the TXT record has changed.
+     * onServiceResolved if the host target, port or TXT record has changed.
      *
-     * You can safely call this method to update the interval for a background thread that's already running.
-     * Either the atomic interval variable is updated and the thread picks it up on the next iteration,
-     * or the thread is torn down when you pass 0 as an interval.
+     * Can be called at any time; the new interval takes effect immediately.
      *
-     * @param intervalMs Poll interval in milliseconds. Pass 0 to disable or to stop a running thread.
+     * @param intervalMs Poll interval in milliseconds. Pass 0 to disable TXT polling; the liveness check keeps running.
      */
     void setTxtPollIntervalMs (uint32_t intervalMs);
 
 private:
     std::thread mPollThread;
     std::condition_variable mPollCv;
-    std::mutex mPollMutex; // used only to satisfy wait_for; does not guard any data
-    std::atomic<uint32_t> mTxtPollIntervalMs = 1000;
+    std::mutex mPollMutex; // used only to satisfy wait_until; does not guard any data
+    std::atomic<uint32_t> mTxtPollIntervalMs { 1000 };
     std::atomic<bool> mStopPollThread { false };
+    std::atomic<bool> mTxtPollIntervalChanged { false }; // wakes pollLoop to reschedule the TXT poll
 
     /// One cancel handle per browsed service type, keyed by wide-string service type.
     std::map<std::wstring, DNS_SERVICE_CANCEL> mBrowseCancels;
 
-    /// All currently known service instances, keyed by fully-qualified instance name (narrow, as received from browse).
+    /// All currently known service instances, keyed by instance name in ASCII lowercase without trailing dots.
+    /// The name as received from browse is kept in ServiceDescription::fullname.
     std::map<std::string, WindnsDiscoveredService> mServices;
 
+    /// Guards mServices and mShuttingDown.
     std::recursive_mutex mLock;
 
-    /// Synchronises the destructor with the final ERROR_CANCELLED browseCallback per active browse.
+    /// Set by the destructor; browse results arriving after that are ignored. Guarded by mLock.
+    bool mShuttingDown = false;
+
+    /// Synchronises the destructor with callbacks that are still to come: the final ERROR_CANCELLED browseCallback per
+    /// active browse, and one callback per issued resolve and address query. Both counters are guarded by mCancelMutex.
     std::mutex mCancelMutex;
     std::condition_variable mCancelCv;
     int mPendingBrowseCancels = 0;
+    int mOutstandingCallbacks = 0;
 
-    // -- Context structs passed as pQueryContext to WinDNS async calls --
-    // Browse passes 'this' directly; resolve and address queries need the instance name too.
-
-    struct ResolveContext
+    /**
+     * Requests waiting to be cancelled by runCancels().
+     */
+    struct PendingCancels
     {
-        WindnsBrowser* owner;
-        std::string instanceName;
-    };
-
-    struct AddressQueryContext
-    {
-        WindnsBrowser* owner;
-        std::string instanceName;
-        /// Embedded result struct kept alive until the async callback fires (pQueryResults == &queryResult).
-        DNS_QUERY_RESULT queryResult {};
+        std::vector<std::shared_ptr<WindnsResolveRequest>> resolves;
+        std::vector<std::shared_ptr<WindnsAddressQuery>> addressQueries;
     };
 
     // -- Static WINAPI callbacks (invoked on WinDNS thread-pool threads) --
@@ -119,67 +129,122 @@ private:
 
     /**
      * Fired by DnsServiceResolve when a service instance is resolved to its host, port, and TXT record.
-     * Routes into onResolveResult() after casting pQueryContext to ResolveContext.
      * @param Status        DNS status code (ERROR_SUCCESS on success).
-     * @param pQueryContext Pointer to a heap-allocated ResolveContext.
+     * @param pQueryContext Heap-allocated std::shared_ptr<WindnsResolveRequest>.
      * @param pInstance     Resolved service instance. Must be freed with DnsServiceFreeInstance.
      */
     static VOID WINAPI resolveCallback (DWORD Status, PVOID pQueryContext, PDNS_SERVICE_INSTANCE pInstance);
 
     /**
-     * Fired by DnsQueryEx for A (IPv4) record queries.
-     * Routes into onAddressResult() after casting pQueryContext to AddressQueryContext.
-     * @param pQueryContext Pointer to a heap-allocated AddressQueryContext.
-     * @param pQueryResults Query results; pQueryResults->pQueryRecords is the DNS_RECORD chain.
+     * Fired by DnsQueryEx for A (IPv4) and AAAA (IPv6) record queries.
+     * @param pQueryContext Heap-allocated std::shared_ptr<WindnsAddressQuery>.
+     * @param pQueryResults Query results (points into the WindnsAddressQuery); pQueryRecords is the DNS_RECORD chain.
      */
-    static VOID WINAPI aQueryCallback (PVOID pQueryContext, PDNS_QUERY_RESULT pQueryResults);
+    static VOID WINAPI addressQueryCallback (PVOID pQueryContext, PDNS_QUERY_RESULT pQueryResults);
+
+    // -- Instance methods --
 
     /**
-     * Fired by DnsQueryEx for AAAA (IPv6) record queries.
-     * Routes into onAddressResult() after casting pQueryContext to AddressQueryContext.
-     * @param pQueryContext Pointer to a heap-allocated AddressQueryContext.
-     * @param pQueryResults Query results; pQueryResults->pQueryRecords is the DNS_RECORD chain.
+     * Applies browse results: adds newly discovered services, refreshes known ones and removes services that sent a
+     * goodbye. The in-flight requests of removed services are added to `pending`.
      */
-    static VOID WINAPI aaaaQueryCallback (PVOID pQueryContext, PDNS_QUERY_RESULT pQueryResults);
-
-    // -- Instance methods (called from callbacks, mLock already held) --
+    void handleBrowseResults (DWORD status, PDNS_RECORD pDnsRecord, PendingCancels& pending);
 
     /**
-     * Issues DnsServiceResolve for the given instance name.
-     * Stores the cancel handle in mServices[instanceName].resolveCancel.
+     * Applies the result of a DnsServiceResolve call to its service.
+     */
+    void handleResolveCallback (const std::shared_ptr<WindnsResolveRequest>& request, DWORD status, PDNS_SERVICE_INSTANCE pInstance);
+
+    /**
+     * Applies the result of a DnsQueryEx A or AAAA query to its service.
+     */
+    void handleAddressQueryCallback (const std::shared_ptr<WindnsAddressQuery>& query, PDNS_QUERY_RESULT pQueryResults);
+
+    /**
+     * Cancels every request in `pending`, then clears it.
+     * Must not be called with mLock held.
+     */
+    void runCancels (PendingCancels& pending);
+
+    /**
+     * Registers that a WinDNS callback is expected (resolve or address query). Call before issuing the request.
+     */
+    void callbackExpected();
+
+    /**
+     * Registers that an expected callback has arrived, or that the request failed synchronously and none will come.
+     * When called from a callback this must be the last access to this object: the destructor may complete after it.
+     */
+    void callbackFinished();
+
+    /**
+     * Issues DnsServiceResolve for the service and stores the request in the service's `resolve`.
      * Must be called with mLock held.
-     * @param instanceName Wide-string fully-qualified instance name (e.g. L"MyDevice._http._tcp.local").
+     * @param serviceKey Key of the service in mServices.
      */
-    void issueResolve (const std::string& instanceName);
+    void issueResolve (const std::string& serviceKey);
 
     /**
-     * Issues DnsQueryEx for A and AAAA records for the given host name,
-     * cancelling any previously in-flight address queries for this service first.
+     * Removes a service: adds its in-flight requests to `pending`, fires onServiceRemovedCallback and erases it.
      * Must be called with mLock held.
-     * @param instanceName Instance name used to look up the service on callback.
-     * @param hostName     Host to query (e.g. "MyDevice.local").
+     * @return The iterator following the erased element.
      */
-    void issueAddressQueries (const std::string& instanceName, const std::string& hostName);
+    std::map<std::string, WindnsDiscoveredService>::iterator removeService (
+        std::map<std::string, WindnsDiscoveredService>::iterator it,
+        PendingCancels& pending);
+
+    /**
+     * Counts resolves that have been in flight for kLivenessInterval as failures and adds them to `pending`, then
+     * removes services with kMaxResolveFailures failures in a row or an expired PTR TTL.
+     * Must be called with mLock held.
+     */
+    void checkLiveness (std::chrono::steady_clock::time_point now, PendingCancels& pending);
+
+    /**
+     * Issues a resolve for every service without one in flight.
+     * Must be called with mLock held.
+     */
+    void resolveIdleServices();
+
+    /**
+     * Issues DnsQueryEx for A and AAAA records for the given host name, unless that query is already in flight.
+     * Must be called with mLock held.
+     * @param serviceKey Key of the service in mServices.
+     * @param hostName   Host to query (e.g. "MyDevice.local").
+     */
+    void issueAddressQueries (const std::string& serviceKey, const std::string& hostName);
+
+    /**
+     * Issues one DnsQueryEx (A or AAAA) for the service, unless that query is already in flight.
+     * Must be called with mLock held.
+     */
+    void issueAddressQuery (
+        WindnsDiscoveredService& service,
+        const std::string& serviceKey,
+        const std::wstring& hostName,
+        DWORD queryOptions,
+        bool isIpv6);
 
     /**
      * Processes a resolved DNS_SERVICE_INSTANCE, populating hostTarget, port, and txtRecord
-     * on the matching service and firing onServiceResolvedCallback.
+     * on the matching service. Fires onServiceResolvedCallback on the first resolve and whenever
+     * one of those three changes.
      * Then issues A/AAAA address queries.
      * Must be called with mLock held.
-     * @param instanceName Instance name.
-     * @param pInstance    Resolved instance data. Caller is responsible for calling DnsServiceFreeInstance.
+     * @param serviceKey Key of the service in mServices.
+     * @param pInstance  Resolved instance data. Caller is responsible for calling DnsServiceFreeInstance.
      */
-    void onResolveResult (const std::string& instanceName, PDNS_SERVICE_INSTANCE pInstance);
+    void onResolveResult (const std::string& serviceKey, PDNS_SERVICE_INSTANCE pInstance);
 
     /**
      * Processes a chain of A or AAAA DNS_RECORD results, inserting new addresses into
      * description.interfaces and firing onAddressAddedCallback for each new address.
      * Zero-TTL records trigger removal from the set and fire onAddressRemovedCallback.
      * Must be called with mLock held.
-     * @param instanceName Instance name.
-     * @param records      Chain of DNS_RECORD results (DNS_TYPE_A or DNS_TYPE_AAAA).
+     * @param serviceKey Key of the service in mServices.
+     * @param records    Chain of DNS_RECORD results (DNS_TYPE_A or DNS_TYPE_AAAA).
      */
-    void onAddressResult (const std::string& instanceName, PDNS_RECORD records);
+    void onAddressResult (const std::string& serviceKey, PDNS_RECORD records);
 
     /**
      * Reports an error via onBrowseErrorCallback if result.hasError().
@@ -188,8 +253,8 @@ private:
     bool reportIfError (const Result& result) const noexcept;
 
     /**
-     * Background thread body for TXT polling. Sleeps for mTxtPollIntervalMs between each
-     * round of re-resolves; wakes early when mStopPollThread is set on destruction.
+     * Background thread body: runs the liveness check every kLivenessInterval and re-resolves services every
+     * mTxtPollIntervalMs (when non-zero), until mStopPollThread is set.
      */
     void pollLoop();
 };
